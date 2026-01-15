@@ -17,7 +17,7 @@ class Program(str, enum.Enum):
     BSCRIM = "BSCRIM"
     BPED = "BPED"
     BEED = "BEED"
-    BSHS = "BHumServ"
+    BHUMSERV = "BHumServ"
 
 
 class User(Base):

@@ -39,7 +39,7 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
         program=user.program,
         email=user.email,
         password=hash_password(user.password),
-        role=UserRole.STUDENT,
+        role=user.role,
     )
 
     db.add(new_user)
@@ -53,6 +53,7 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
 @router.post("/login")
 def login(login_data: UserLogin, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.student_id_no == login_data.student_id_no).first()
+
     if not user or not verify_password(login_data.password, user.password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -62,6 +63,7 @@ def login(login_data: UserLogin, db: Session = Depends(get_db)):
     return {
         "message": f"Welcome {user.first_name} {user.last_name}",
         "student_id_no": user.student_id_no,
+        "role": user.role.value, 
     }
 
 
