@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from app.core.database import engine, Base
 from app.models.user import User
-from app.routes import auth, counts
+from app.routes import auth, counts, events
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="ARA Biometric Attendance System", version="1.0.0")
@@ -18,6 +18,7 @@ Base.metadata.create_all(bind=engine)
 
 app.include_router(auth.router)
 app.include_router(counts.router)
+app.include_router(events.router)
 
 
 @app.get("/")

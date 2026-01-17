@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.user import User, UserRole
 from app.schemas.user import UserCreate, UserResponse, UserLogin
-from app.core.security import hash_password, verify_password
+from app.core.security import hash_password, verify_password, create_access_token
 from datetime import datetime, timedelta
 import secrets
 from app.models.password_reset import PasswordReset
@@ -60,10 +60,15 @@ def login(login_data: UserLogin, db: Session = Depends(get_db)):
             detail="Invalid student ID or password",
         )
 
+    # Create JWT token
+    token_data = {"user_id": user.id, "role": user.role.value}
+    access_token = create_access_token(token_data)
+
     return {
-        "message": f"Welcome {user.first_name} {user.last_name}",
+        "access_token": access_token,
+        "token_type": "bearer",
         "student_id_no": user.student_id_no,
-        "role": user.role.value, 
+        "role": user.role.value,
     }
 
 
