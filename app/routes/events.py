@@ -59,6 +59,13 @@ def get_all_events(db: Session = Depends(get_db)):
     return events
 
 
+# ------------------- COUNT ALL EVENTS -------------------
+@router.get("/count")
+def get_event_count(db: Session = Depends(get_db)):
+    total = db.query(Event).count()
+    return {"total_events": total}
+
+
 # ------------------- UPDATE EVENT (ADMIN ONLY) -------------------
 @router.put("/{event_id}", response_model=EventResponse)
 def update_event(
