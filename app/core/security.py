@@ -1,3 +1,4 @@
+# app/core/auth.py
 import os
 from dotenv import load_dotenv
 import bcrypt
@@ -5,6 +6,9 @@ import jwt
 from typing import Dict
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.orm import Session
+from app.core.database import get_db
+from app.models import User
 
 # Load environment variables
 load_dotenv()
@@ -48,7 +52,8 @@ def decode_access_token(token: str) -> Dict:
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
-def get_current_user(token: str = Depends(oauth2_scheme)):
+def get_current_user_dict(token: str = Depends(oauth2_scheme)):
+    """Returns user info as dictionary"""
     payload = decode_access_token(token)
     user_id = payload.get("user_id")
     role = payload.get("role")
@@ -57,3 +62,25 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
         )
     return {"user_id": user_id, "role": role}
+
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
+) -> User:
+    """Returns the full User object from database"""
+    payload = decode_access_token(token)
+    user_id = payload.get("user_id")
+
+    if user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
+        )
+
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found"
+        )
+
+    return user

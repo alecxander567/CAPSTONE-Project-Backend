@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, Text, Date, Time, DateTime, Fore
 from sqlalchemy.sql import func
 
 from app.core.database import Base
+from sqlalchemy.orm import relationship
 
 
 class Event(Base):
@@ -21,3 +22,5 @@ class Event(Base):
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    notifications = relationship("Notification", back_populates="event")
