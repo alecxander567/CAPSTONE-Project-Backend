@@ -1,4 +1,3 @@
-# app/routes/notification_ws.py
 from fastapi import WebSocket, WebSocketDisconnect, Query
 from typing import List, Optional
 import asyncio

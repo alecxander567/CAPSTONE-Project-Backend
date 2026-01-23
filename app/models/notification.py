@@ -1,4 +1,13 @@
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Text,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    UniqueConstraint,
+)
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.core.database import Base
@@ -28,3 +37,9 @@ class Notification(Base):
 
     user = relationship("User", back_populates="notifications")
     event = relationship("Event", back_populates="notifications")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "event_id", "type", name="uq_user_event_notification"
+        ),
+    )

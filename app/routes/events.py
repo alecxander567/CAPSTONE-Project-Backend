@@ -13,11 +13,8 @@ router = APIRouter(prefix="/events", tags=["Events"])
 
 
 # ------------------- ADDING OF EVENTS (ADMIN ONLY) -------------------
-from fastapi import BackgroundTasks
-
-
 @router.post("/", response_model=EventResponse, status_code=201)
-async def create_event(
+def create_event(
     event: EventCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -39,18 +36,15 @@ async def create_event(
     db.commit()
     db.refresh(new_event)
 
-    import asyncio
-    from app.services.notifications import notify_today_events
-
-    asyncio.create_task(notify_today_events(db))
+    try:
+        notify_today_events(db)
+    except Exception as e:
+        pass
 
     return new_event
 
 
 # ------------------- GET ALL EVENTS -------------------
-from typing import List
-
-
 @router.get("/", response_model=List[EventResponse])
 def get_all_events(db: Session = Depends(get_db)):
     events = (
@@ -94,6 +88,11 @@ def update_event(
 
     db.commit()
     db.refresh(existing_event)
+
+    try:
+        notify_today_events(db)
+    except Exception as e:
+        pass
 
     return existing_event
 
