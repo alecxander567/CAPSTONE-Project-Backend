@@ -30,7 +30,7 @@ def notify_today_events(db: Session):
         current_datetime = datetime.now()
         time_diff = (event_datetime - current_datetime).total_seconds()
 
-        if not (-120 <= time_diff <= 120):
+        if not (0 < time_diff <= 120):
             continue
 
         for user in users:
@@ -60,8 +60,11 @@ def notify_today_events(db: Session):
             notification = Notification(
                 user_id=user.id,
                 event_id=event.id,
-                title="Event Starting Now",
-                message=f"The event '{event.title}' is starting at {event.start_time.strftime('%I:%M %p')}!",
+                title=event.title,
+                message=(
+                    f"{event.description}\n\n"
+                    f"Starts at {event.start_time.strftime('%I:%M %p')}"
+                ),
                 type="event",
                 is_read=False,
             )
