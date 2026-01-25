@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.database import engine, Base
 from app.models.user import User
-from app.routes import auth, counts, events, notification
+from app.routes import auth, counts, events, notification, fingerprint
 from app.routes.notification_ws import websocket_endpoint
 from app.core.background_task import event_notifier_loop
 import asyncio
@@ -28,6 +28,7 @@ app.include_router(auth.router)
 app.include_router(counts.router)
 app.include_router(events.router)
 app.include_router(notification.router)
+app.include_router(fingerprint.router)
 
 app.websocket("/ws/notifications/")(websocket_endpoint)
 
