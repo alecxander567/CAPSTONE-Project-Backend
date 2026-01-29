@@ -8,6 +8,11 @@ from app.models.user import User
 from app.schemas.event import EventCreate, EventResponse, EventUpdate
 from app.core.security import get_current_user
 from app.services.notifications import notify_today_events
+from sqlalchemy import extract
+from fastapi import Query
+from typing import List
+from app.schemas.event import EventResponse
+
 
 router = APIRouter(prefix="/events", tags=["Events"])
 
@@ -122,6 +127,31 @@ def delete_event(
     db.commit()
 
     return {"message": "Event deleted successfully"}
+
+
+# ------------------- GET EVENTS BY MONTH (CALENDAR VIEW) -------------------
+@router.get("/calendar", response_model=dict)
+def get_events_by_month(
+    year: int = Query(...),
+    month: int = Query(..., ge=1, le=12),
+    db: Session = Depends(get_db),
+):
+    events = (
+        db.query(Event)
+        .filter(extract("year", Event.event_date) == year)
+        .filter(extract("month", Event.event_date) == month)
+        .order_by(Event.event_date.asc(), Event.start_time.asc())
+        .all()
+    )
+
+    return {
+        "year": year,
+        "month": month,
+        "total_events": len(events),
+        "events": [
+            EventResponse.from_orm(e) for e in events
+        ],  
+    }
 
 
 # ------------------- GET SINGLE EVENT BY ID -------------------
