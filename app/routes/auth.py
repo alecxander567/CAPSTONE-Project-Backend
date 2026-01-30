@@ -3,8 +3,13 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.models.user import User, UserRole
-from app.schemas.user import UserCreate, UserResponse, UserLogin
-from app.core.security import hash_password, verify_password, create_access_token
+from app.schemas.user import UserCreate, UserResponse, UserLogin, UserProfileUpdate
+from app.core.security import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    get_current_user,
+)
 from datetime import datetime, timedelta
 import secrets
 from app.models.password_reset import PasswordReset
@@ -119,3 +124,53 @@ def reset_password(data: ResetPasswordSchema, db: Session = Depends(get_db)):
     db.commit()
 
     return {"message": "Password updated successfully"}
+
+
+# ------------------- GET CURRENT USER -------------------
+@router.get("/profile", response_model=UserResponse)
+def get_user_profile(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+
+    if not current_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return current_user
+
+
+# ------------------- UPDATE USER PROFILE -------------------
+@router.put("/profile", response_model=UserResponse)
+def update_user_profile(
+    profile_data: UserProfileUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+
+    if not current_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if profile_data.email and profile_data.email != current_user.email:
+        existing_email = (
+            db.query(User)
+            .filter(User.email == profile_data.email, User.id != current_user.id)
+            .first()
+        )
+        if existing_email:
+            raise HTTPException(status_code=400, detail="Email already in use")
+
+    # Update only the fields that are provided
+    if profile_data.first_name is not None:
+        current_user.first_name = profile_data.first_name
+    if profile_data.last_name is not None:
+        current_user.last_name = profile_data.last_name
+    if profile_data.middle_initial is not None:
+        current_user.middle_initial = profile_data.middle_initial
+    if profile_data.email is not None:
+        current_user.email = profile_data.email
+    if profile_data.program is not None:
+        current_user.program = profile_data.program
+
+    db.commit()
+    db.refresh(current_user)
+
+    return current_user

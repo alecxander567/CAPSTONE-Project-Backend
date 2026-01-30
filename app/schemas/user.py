@@ -33,3 +33,14 @@ class UserResponse(BaseModel):
 class UserLogin(BaseModel):
     student_id_no: str
     password: str
+
+
+class UserProfileUpdate(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    middle_initial: Optional[str] = None
+    email: Optional[EmailStr] = None
+    program: Optional[str] = None
+
+    class Config:
+        from_attributes = True
