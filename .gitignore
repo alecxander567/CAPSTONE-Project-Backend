@@ -76,4 +76,4 @@ tmp/
 *.swo
 
 alembic.ini
-./alembic
+alembic/
