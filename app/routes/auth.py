@@ -1,5 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.orm import Session
+import os
+import shutil
+from pathlib import Path
+import uuid
 
 from app.core.database import get_db
 from app.models.user import User, UserRole
@@ -19,15 +23,25 @@ from app.core.mail import send_email
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
+# ------------------- UPLOADS DIRECTORY -------------------
+UPLOAD_DIR = Path("uploads/profile_pictures")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+
 
 # ------------------- REGISTER -------------------
 @router.post(
     "/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED
 )
 def register_user(user: UserCreate, db: Session = Depends(get_db)):
-    existing_email = db.query(User).filter(User.email == user.email).first()
-    if existing_email:
-        raise HTTPException(status_code=400, detail="Email already registered")
+    # Check if mobile phone already exists
+    existing_mobile = (
+        db.query(User).filter(User.mobile_phone == user.mobile_phone).first()
+    )
+    if existing_mobile:
+        raise HTTPException(status_code=400, detail="Mobile phone already registered")
 
     if user.student_id_no:
         existing_student = (
@@ -42,7 +56,7 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
         last_name=user.last_name,
         middle_initial=user.middle_initial,
         program=user.program,
-        email=user.email,
+        mobile_phone=user.mobile_phone,
         password=hash_password(user.password),
         role=user.role,
     )
@@ -86,10 +100,10 @@ def logout():
 # ------------------- FORGOT PASSWORD -------------------
 @router.post("/forgot-password")
 def forgot_password(data: ForgotPasswordSchema, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.student_id_no == data.student_id).first()
+    user = db.query(User).filter(User.mobile_phone == data.mobile_phone).first()
 
     if not user:
-        raise HTTPException(status_code=404, detail="Student not found")
+        raise HTTPException(status_code=404, detail="Phone number not found")
 
     token = secrets.token_urlsafe(32)
     expires = datetime.utcnow() + timedelta(minutes=15)
@@ -149,14 +163,20 @@ def update_user_profile(
     if not current_user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if profile_data.email and profile_data.email != current_user.email:
-        existing_email = (
+    if (
+        profile_data.mobile_phone
+        and profile_data.mobile_phone != current_user.mobile_phone
+    ):
+        existing_mobile = (
             db.query(User)
-            .filter(User.email == profile_data.email, User.id != current_user.id)
+            .filter(
+                User.mobile_phone == profile_data.mobile_phone,
+                User.id != current_user.id,
+            )
             .first()
         )
-        if existing_email:
-            raise HTTPException(status_code=400, detail="Email already in use")
+        if existing_mobile:
+            raise HTTPException(status_code=400, detail="Mobile phone already in use")
 
     # Update only the fields that are provided
     if profile_data.first_name is not None:
@@ -165,12 +185,84 @@ def update_user_profile(
         current_user.last_name = profile_data.last_name
     if profile_data.middle_initial is not None:
         current_user.middle_initial = profile_data.middle_initial
-    if profile_data.email is not None:
-        current_user.email = profile_data.email
+    if profile_data.mobile_phone is not None:
+        current_user.mobile_phone = profile_data.mobile_phone
     if profile_data.program is not None:
         current_user.program = profile_data.program
+    if profile_data.profile_image is not None:
+        current_user.profile_image = profile_data.profile_image
 
     db.commit()
     db.refresh(current_user)
 
     return current_user
+
+
+# ------------------- UPLOAD PROFILE PICTURE -------------------
+@router.post("/profile/upload-picture")
+async def upload_profile_picture(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Upload a profile picture for the current user"""
+
+    # Validate file extension
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type not allowed. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}",
+        )
+
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large. Maximum size: {MAX_FILE_SIZE / (1024*1024)}MB",
+        )
+
+    await file.seek(0)
+
+    if current_user.profile_image:
+        old_file_path = Path(current_user.profile_image)
+        if old_file_path.exists():
+            old_file_path.unlink()
+
+    # Generate unique filename
+    unique_filename = f"{uuid.uuid4()}{file_ext}"
+    file_path = UPLOAD_DIR / unique_filename
+
+    with file_path.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    current_user.profile_image = str(file_path)
+    db.commit()
+    db.refresh(current_user)
+
+    return {
+        "message": "Profile picture uploaded successfully",
+        "profile_image": str(file_path),
+    }
+
+
+# ------------------- DELETE PROFILE PICTURE -------------------
+@router.delete("/profile/delete-picture")
+def delete_profile_picture(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete the current user's profile picture"""
+
+    if not current_user.profile_image:
+        raise HTTPException(status_code=404, detail="No profile picture to delete")
+
+    # Delete file from filesystem
+    file_path = Path(current_user.profile_image)
+    if file_path.exists():
+        file_path.unlink()
+
+    current_user.profile_image = None
+    db.commit()
+
+    return {"message": "Profile picture deleted successfully"}

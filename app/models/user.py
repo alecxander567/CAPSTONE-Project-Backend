@@ -21,7 +21,7 @@ class Program(str, enum.Enum):
 
 
 class FingerprintStatus(str, enum.Enum):
-    NOT_ENROLLED = "not_enrolled" 
+    NOT_ENROLLED = "not_enrolled"
     PENDING = "pending"
     ENROLLED = "enrolled"
     FAILED = "failed"
@@ -40,12 +40,15 @@ class User(Base):
     program = Column(Enum(Program), nullable=False)
     role = Column(Enum(UserRole), nullable=False, default=UserRole.STUDENT)
 
-    email = Column(String(255), unique=True, index=True, nullable=False)
+    mobile_phone = Column(String(20), unique=True, index=True, nullable=False)
+
+    profile_image = Column(String(255), nullable=True)
+
     password = Column(String(255), nullable=False)
 
     status = Column(
         String(20),
-        default=FingerprintStatus.NOT_ENROLLED.value,  
+        default=FingerprintStatus.NOT_ENROLLED.value,
         nullable=False,
     )
 
@@ -53,7 +56,6 @@ class User(Base):
     notifications = relationship(
         "Notification", back_populates="user", cascade="all, delete"
     )
-
     fingerprints = relationship(
         "Fingerprint", back_populates="user", cascade="all, delete-orphan"
     )

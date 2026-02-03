@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 
 
 class ForgotPasswordSchema(BaseModel):
-    student_id: str = Field(..., example="2023-0001")
+    mobile_phone: str = Field(..., example="09123456789")
 
 
 class ResetPasswordSchema(BaseModel):

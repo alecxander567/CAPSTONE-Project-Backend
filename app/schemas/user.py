@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 from app.models.user import UserRole
@@ -9,10 +9,10 @@ class UserCreate(BaseModel):
     first_name: str
     last_name: str
     middle_initial: Optional[str] = None
-    program: Optional[str] = None
-    email: EmailStr
+    program: str
+    mobile_phone: str
     password: str
-    role: UserRole
+    role: UserRole = UserRole.STUDENT
 
 
 class UserResponse(BaseModel):
@@ -21,10 +21,14 @@ class UserResponse(BaseModel):
     first_name: str
     last_name: str
     middle_initial: Optional[str]
-    program: Optional[str]
-    email: EmailStr
+    program: str
+    mobile_phone: str
+    profile_image: Optional[str]
     role: str
+    fingerprint_status: Optional[str] = None
+    status: str
     created_at: datetime
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -39,8 +43,9 @@ class UserProfileUpdate(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     middle_initial: Optional[str] = None
-    email: Optional[EmailStr] = None
+    mobile_phone: Optional[str] = None
     program: Optional[str] = None
+    profile_image: Optional[str] = None
 
     class Config:
         from_attributes = True
