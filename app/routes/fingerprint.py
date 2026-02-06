@@ -1,90 +1,88 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
-from app.models.user import User, FingerprintStatus
+from app.models.user import User, FingerprintStatus, EnrollmentStep
 import httpx
 import asyncio
+import random
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/fingerprints", tags=["Fingerprints"])
 
-ESP32_URL = "http://192.168.1.100" 
+
+# Pydantic model
+class EnrollmentRequest(BaseModel):
+    user_id: int
 
 
-# ------------------- TRIGGER CONNECTION FROM ESP32 AND ENROLL FINGERPRINT -------------------
-@router.post("/enroll/{user_id}")
-async def trigger_fingerprint_enrollment(
-    user_id: int,
+# ------------------- START ENROLLMENT OF FINGERPRINT -------------------
+@router.post("/start-enrollment")
+def start_enrollment(
+    request: EnrollmentRequest,
     db: Session = Depends(get_db),
 ):
-    user = db.query(User).filter(User.id == user_id).first()
-
+    user = db.query(User).filter(User.id == request.user_id).first()
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
+        raise HTTPException(status_code=404, detail="User not found")
 
-    if user.status == FingerprintStatus.ENROLLED:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User already has a fingerprint enrolled",
-        )
+    # Generate a dynamic finger_id
+    finger_id = random.randint(1000, 9999)
 
+    user.finger_id = finger_id
+    user.enroll_status = EnrollmentStep.PENDING
     user.status = FingerprintStatus.PENDING
+
     db.commit()
 
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.post(f"{ESP32_URL}/enroll", timeout=2.0)
-    except Exception as e:
-        print(f"Error connecting to ESP32: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Cannot connect to fingerprint sensor",
-        )
-
-    return {
-        "message": "Fingerprint enrollment started",
-        "user_id": user.id,
-        "fingerprint_status": user.status,
-    }
+    return {"message": "Enrollment started", "finger_id": finger_id}
 
 
-# ------------------- GET FINGERPRINT STATUS -------------------
-@router.get("/enrollment-status/{user_id}")
-async def get_enrollment_status(
-    user_id: int,
-    db: Session = Depends(get_db),
-):
-    user = db.query(User).filter(User.id == user_id).first()
+# ------------------- ESP32 POLLS FOR PENDING ENROLLMENT -------------------
+@router.get("/check-enrollment")
+def check_enrollment(db: Session = Depends(get_db)):
+    user = (
+        db.query(User)
+        .filter(User.enroll_status == EnrollmentStep.PENDING)
+        .order_by(User.id.asc())
+        .first()
+    )
 
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
-        )
+        return "none"
 
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{ESP32_URL}/status", timeout=2.0)
-            esp_status = response.json()
+    return str(user.finger_id)
 
-            if esp_status["status"] == "success":
-                user.status = FingerprintStatus.ENROLLED
-                db.commit()
-            elif esp_status["status"] == "failed":
-                user.status = FingerprintStatus.FAILED
-                db.commit()
 
-            return {
-                "status": esp_status["status"],
-                "step": esp_status["step"],
-                "message": esp_status.get("message", ""),
-            }
-    except Exception as e:
-        print(f"Error getting ESP32 status: {e}")
-        return {
-            "status": "failed",
-            "step": "connection_error",
-            "message": "Cannot connect to sensor",
-        }
+# ------------------- UPDATES ENROLLMENT STEPS -------------------
+@router.get("/update-enrollment")
+def update_enrollment(
+    id: int,
+    status: EnrollmentStep,
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.finger_id == id).first()
+    if not user:
+        return "error"
+
+    user.enroll_status = status
+
+    if status == EnrollmentStep.SUCCESS:
+        user.status = FingerprintStatus.ENROLLED
+    elif status == EnrollmentStep.ERROR:
+        user.status = FingerprintStatus.FAILED
+
+    db.commit()
+    return "ok"
+
+
+# ------------------- FRONTEND POLLS ENROLLMENT STATUS -------------------
+@router.get("/get-status")
+def get_status(
+    finger_id: int,
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.finger_id == finger_id).first()
+    if not user:
+        return "none"
+
+    return user.enroll_status.value

@@ -27,6 +27,16 @@ class FingerprintStatus(str, enum.Enum):
     FAILED = "failed"
 
 
+class EnrollmentStep(str, enum.Enum):
+    NOT_ENROLLED = "not_enrolled"
+    PENDING = "pending"
+    PLACE_FINGER = "place_finger"
+    REMOVE_FINGER = "remove_finger"
+    PLACE_AGAIN = "place_again"
+    SUCCESS = "success"
+    ERROR = "error"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -41,14 +51,20 @@ class User(Base):
     role = Column(Enum(UserRole), nullable=False, default=UserRole.STUDENT)
 
     mobile_phone = Column(String(20), unique=True, index=True, nullable=False)
-
     profile_image = Column(String(255), nullable=True)
-
     password = Column(String(255), nullable=False)
 
+    finger_id = Column(Integer, unique=True, nullable=True)
+
+    enroll_status = Column(
+        Enum(EnrollmentStep),
+        default=EnrollmentStep.NOT_ENROLLED,
+        nullable=False,
+    )
+
     status = Column(
-        String(20),
-        default=FingerprintStatus.NOT_ENROLLED.value,
+        Enum(FingerprintStatus),
+        default=FingerprintStatus.NOT_ENROLLED,
         nullable=False,
     )
 
