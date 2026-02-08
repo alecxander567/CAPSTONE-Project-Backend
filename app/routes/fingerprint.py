@@ -25,8 +25,8 @@ def start_enrollment(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Generate a dynamic finger_id
-    finger_id = random.randint(1000, 9999)
+    # generate finger_id here
+    finger_id = random.randint(1, 127)
 
     user.finger_id = finger_id
     user.enroll_status = EnrollmentStep.PENDING
@@ -34,7 +34,10 @@ def start_enrollment(
 
     db.commit()
 
-    return {"message": "Enrollment started", "finger_id": finger_id}
+    return {
+        "message": "Enrollment started",
+        "finger_id": finger_id,
+    }
 
 
 # ------------------- ESP32 POLLS FOR PENDING ENROLLMENT -------------------
@@ -72,10 +75,10 @@ def update_enrollment(
         user.status = FingerprintStatus.FAILED
 
     db.commit()
-    return "ok"
+    return "updated"
 
 
-# ------------------- FRONTEND POLLS ENROLLMENT STATUS -------------------
+# ------------------- LEGACY ENDPOINT -------------------
 @router.get("/get-status")
 def get_status(
     finger_id: int,
