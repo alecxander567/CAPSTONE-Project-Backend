@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
-from app.models.user import UserRole
+from app.models.user import UserRole, YearLevel
 
 
 class UserCreate(BaseModel):
@@ -10,6 +10,7 @@ class UserCreate(BaseModel):
     last_name: str
     middle_initial: Optional[str] = None
     program: str
+    year_level: YearLevel
     mobile_phone: str
     password: str
     role: UserRole = UserRole.STUDENT
@@ -22,6 +23,7 @@ class UserResponse(BaseModel):
     last_name: str
     middle_initial: Optional[str]
     program: str
+    year_level: Optional[YearLevel]
     mobile_phone: str
     profile_image: Optional[str]
     role: str
@@ -45,6 +47,7 @@ class UserProfileUpdate(BaseModel):
     middle_initial: Optional[str] = None
     mobile_phone: Optional[str] = None
     program: Optional[str] = None
+    year_level: int | None
     profile_image: Optional[str] = None
 
     class Config:

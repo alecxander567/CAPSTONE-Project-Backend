@@ -56,6 +56,7 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
         last_name=user.last_name,
         middle_initial=user.middle_initial,
         program=user.program,
+        year_level=user.year_level,
         mobile_phone=user.mobile_phone,
         password=hash_password(user.password),
         role=user.role,
@@ -163,6 +164,7 @@ def update_user_profile(
     if not current_user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Check for mobile phone uniqueness
     if (
         profile_data.mobile_phone
         and profile_data.mobile_phone != current_user.mobile_phone
@@ -178,6 +180,9 @@ def update_user_profile(
         if existing_mobile:
             raise HTTPException(status_code=400, detail="Mobile phone already in use")
 
+    # Map numeric year_level to string enum
+    year_level_map = {1: "FIRST", 2: "SECOND", 3: "THIRD", 4: "FOURTH"}
+
     # Update only the fields that are provided
     if profile_data.first_name is not None:
         current_user.first_name = profile_data.first_name
@@ -191,6 +196,8 @@ def update_user_profile(
         current_user.program = profile_data.program
     if profile_data.profile_image is not None:
         current_user.profile_image = profile_data.profile_image
+    if profile_data.year_level is not None:
+        current_user.year_level = year_level_map.get(profile_data.year_level)
 
     db.commit()
     db.refresh(current_user)

@@ -37,6 +37,13 @@ class EnrollmentStep(str, enum.Enum):
     ERROR = "error"
 
 
+class YearLevel(str, enum.Enum):
+    FIRST = "1st year"
+    SECOND = "2nd year"
+    THIRD = "3rd year"
+    FOURTH = "4th year"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -49,6 +56,8 @@ class User(Base):
 
     program = Column(Enum(Program), nullable=False)
     role = Column(Enum(UserRole), nullable=False, default=UserRole.STUDENT)
+
+    year_level = Column(Enum(YearLevel), nullable=False)
 
     mobile_phone = Column(String(20), unique=True, index=True, nullable=False)
     profile_image = Column(String(255), nullable=True)
