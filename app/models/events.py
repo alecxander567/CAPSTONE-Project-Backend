@@ -1,8 +1,15 @@
 from sqlalchemy import Column, Integer, String, Text, Date, Time, DateTime, ForeignKey
 from sqlalchemy.sql import func
-
-from app.core.database import Base
 from sqlalchemy.orm import relationship
+from app.core.database import Base
+from datetime import datetime, date
+from enum import Enum
+
+
+class EventStatus(str, Enum):
+    UPCOMING = "upcoming"
+    ONGOING = "ongoing"
+    DONE = "done"
 
 
 class Event(Base):
@@ -20,7 +27,23 @@ class Event(Base):
     location = Column(String(255), nullable=False)
 
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
-
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     notifications = relationship("Notification", back_populates="event")
+
+    @property
+    def status(self) -> EventStatus:
+        now = datetime.now()
+        today = date.today()
+
+        if self.event_date < today:
+            return EventStatus.DONE
+
+        if self.event_date == today:
+            if self.start_time <= now.time() <= self.end_time:
+                return EventStatus.ONGOING
+            if now.time() > self.end_time:
+                return EventStatus.DONE
+            return EventStatus.UPCOMING
+
+        return EventStatus.UPCOMING
