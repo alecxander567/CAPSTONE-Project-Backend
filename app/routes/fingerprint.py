@@ -2,8 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.user import User, FingerprintStatus, EnrollmentStep
-import httpx
-import asyncio
+from fastapi.responses import PlainTextResponse
 import random
 from pydantic import BaseModel
 
@@ -25,24 +24,33 @@ def start_enrollment(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # generate finger_id here
+    if user.enroll_status not in [EnrollmentStep.SUCCESS, EnrollmentStep.ERROR, None]:
+        print(f"User {user.id} already has pending enrollment")
+
+    # Generate new finger_id (avoid collisions)
+    existing_ids = {u.finger_id for u in db.query(User.finger_id).all() if u.finger_id}
     finger_id = random.randint(1, 127)
+    while finger_id in existing_ids:
+        finger_id = random.randint(1, 127)
 
     user.finger_id = finger_id
     user.enroll_status = EnrollmentStep.PENDING
     user.status = FingerprintStatus.PENDING
 
     db.commit()
+    db.refresh(user)
 
     return {
         "message": "Enrollment started",
         "finger_id": finger_id,
+        "status": user.status.value,
     }
 
 
 # ------------------- ESP32 POLLS FOR PENDING ENROLLMENT -------------------
 @router.get("/check-enrollment")
 def check_enrollment(db: Session = Depends(get_db)):
+
     user = (
         db.query(User)
         .filter(User.enroll_status == EnrollmentStep.PENDING)
@@ -51,41 +59,65 @@ def check_enrollment(db: Session = Depends(get_db)):
     )
 
     if not user:
-        return "none"
+        return PlainTextResponse("none")
 
-    return str(user.finger_id)
+    return PlainTextResponse(str(user.finger_id))
 
 
-# ------------------- UPDATES ENROLLMENT STEPS -------------------
+# ------------------- ESP32 UPDATES ENROLLMENT STEPS -------------------
 @router.get("/update-enrollment")
 def update_enrollment(
     id: int,
-    status: EnrollmentStep,
+    status: str,
     db: Session = Depends(get_db),
 ):
+
+    if id == 0:
+        return PlainTextResponse("invalid_id")
+
     user = db.query(User).filter(User.finger_id == id).first()
+
     if not user:
-        return "error"
+        return PlainTextResponse("error")
 
-    user.enroll_status = status
+    # Map ESP32 string to backend enum
+    status_map = {
+        "pending": (EnrollmentStep.PENDING, FingerprintStatus.PENDING),
+        "place_finger": (EnrollmentStep.PLACE_FINGER, FingerprintStatus.PENDING),
+        "remove_finger": (EnrollmentStep.REMOVE_FINGER, FingerprintStatus.PENDING),
+        "place_again": (EnrollmentStep.PLACE_AGAIN, FingerprintStatus.PENDING),
+        "success": (EnrollmentStep.SUCCESS, FingerprintStatus.ENROLLED),
+        "error": (EnrollmentStep.ERROR, FingerprintStatus.FAILED),
+    }
 
-    if status == EnrollmentStep.SUCCESS:
-        user.status = FingerprintStatus.ENROLLED
-    elif status == EnrollmentStep.ERROR:
-        user.status = FingerprintStatus.FAILED
+    if status not in status_map:
+        return PlainTextResponse("invalid_status")
+
+    enroll_step, fingerprint_status = status_map[status]
+    user.enroll_status = enroll_step
+    user.status = fingerprint_status
 
     db.commit()
-    return "updated"
+    db.refresh(user)
+
+    return PlainTextResponse("updated")
 
 
-# ------------------- LEGACY ENDPOINT -------------------
+# ------------------- FRONTEND POLLS FOR STATUS UPDATES -------------------
 @router.get("/get-status")
 def get_status(
     finger_id: int,
     db: Session = Depends(get_db),
 ):
-    user = db.query(User).filter(User.finger_id == finger_id).first()
-    if not user:
-        return "none"
 
-    return user.enroll_status.value
+    user = db.query(User).filter(User.finger_id == finger_id).first()
+
+    if not user:
+        return {"status": "failed", "step": "error", "message": "User not found"}
+
+    result = {
+        "status": user.status.value,
+        "step": user.enroll_status.value,
+    }
+
+    return result
