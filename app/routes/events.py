@@ -4,6 +4,7 @@ from typing import List
 
 from app.core.database import get_db
 from app.models.events import Event
+from app.models.attendance import Attendance
 from app.models.user import User
 from app.schemas.event import EventCreate, EventResponse, EventUpdate
 from app.core.security import get_current_user
@@ -123,6 +124,9 @@ def delete_event(
             detail="Event not found",
         )
 
+    # Delete all attendance records for this event first
+    db.query(Attendance).filter(Attendance.event_id == event_id).delete()
+
     db.delete(event)
     db.commit()
 
@@ -148,9 +152,7 @@ def get_events_by_month(
         "year": year,
         "month": month,
         "total_events": len(events),
-        "events": [
-            EventResponse.from_orm(e) for e in events
-        ],  
+        "events": [EventResponse.from_orm(e) for e in events],
     }
 
 
