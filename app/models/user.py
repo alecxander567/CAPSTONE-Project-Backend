@@ -3,21 +3,12 @@ from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 import enum
+from sqlalchemy import ForeignKey
 
 
 class UserRole(str, enum.Enum):
     STUDENT = "student"
     ADMIN = "admin"
-
-
-class Program(str, enum.Enum):
-    BSED = "BSED"
-    BSBA = "BSBA"
-    BSIT = "BSIT"
-    BSCRIM = "BSCRIM"
-    BPED = "BPED"
-    BEED = "BEED"
-    BHUMSERV = "BHumServ"
 
 
 class FingerprintStatus(str, enum.Enum):
@@ -54,10 +45,13 @@ class User(Base):
     last_name = Column(String(100), nullable=False)
     middle_initial = Column(String(5), nullable=True)
 
-    program = Column(Enum(Program), nullable=False)
-    role = Column(Enum(UserRole), nullable=False, default=UserRole.STUDENT)
+    program_id = Column(Integer, ForeignKey("programs.id"), nullable=True)
+    program = relationship("Program", back_populates="users")
+    role = Column(
+        Enum(UserRole, native_enum=False), nullable=False, default=UserRole.STUDENT
+    )
 
-    year_level = Column(Enum(YearLevel), nullable=False)
+    year_level = Column(Enum(YearLevel), nullable=True)
 
     mobile_phone = Column(String(20), unique=True, index=True, nullable=False)
     profile_image = Column(String(255), nullable=True)
@@ -83,6 +77,10 @@ class User(Base):
     )
     fingerprints = relationship(
         "Fingerprint", back_populates="user", cascade="all, delete-orphan"
+    )
+
+    attendances = relationship(
+        "Attendance", back_populates="user", cascade="all, delete-orphan"
     )
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())

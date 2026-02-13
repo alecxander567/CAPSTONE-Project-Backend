@@ -6,8 +6,13 @@ from fastapi.responses import PlainTextResponse
 import random
 from pydantic import BaseModel
 from datetime import datetime
+from app.models.attendance import Attendance, AttendanceStatus
+from app.models.events import Event
+from datetime import datetime, date
 
 router = APIRouter(prefix="/fingerprints", tags=["Fingerprints"])
+
+device_mode = "idle"
 
 
 class EnrollmentRequest(BaseModel):
@@ -26,6 +31,8 @@ def start_enrollment(
     req: Request,
     db: Session = Depends(get_db),
 ):
+    global device_mode
+
     client_ip = req.client.host
     log_request("START-ENROLLMENT", client_ip, f"| user_id={request.user_id}")
 
@@ -63,6 +70,10 @@ def start_enrollment(
     try:
         db.commit()
         db.refresh(user)
+
+        # Set device to enroll mode
+        device_mode = "enroll"
+
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
@@ -122,6 +133,8 @@ def update_enrollment(
     status: str,
     db: Session = Depends(get_db),
 ):
+    global device_mode
+
     client_ip = req.client.host
     log_request("UPDATE-ENROLLMENT", client_ip, f"| finger_id={id} | status={status}")
 
@@ -151,6 +164,9 @@ def update_enrollment(
     try:
         db.commit()
         db.refresh(user)
+
+        if status in ["success", "error"]:
+            device_mode = "idle"
 
     except Exception as e:
         db.rollback()
@@ -236,3 +252,96 @@ def debug_enrollment(finger_id: int, db: Session = Depends(get_db)):
         "status": user.status.value if user.status else None,
         "enroll_status": user.enroll_status.value if user.enroll_status else None,
     }
+
+
+# ------------------- START ATTENDANCE -------------------
+@router.post("/start-attendance")
+def start_attendance():
+    global device_mode
+    device_mode = "attendance"
+    return {"message": "Attendance mode started"}
+
+
+# ------------------- STOP ATTENDANCE -------------------
+@router.post("/stop-attendance")
+def stop_attendance():
+    global device_mode
+    device_mode = "idle"
+    return {"message": "Attendance mode stopped"}
+
+
+# ------------------- MARK ATTENDANCE -------------------
+@router.get("/mark-attendance")
+def mark_attendance(
+    req: Request,
+    finger_id: int,
+    db: Session = Depends(get_db),
+):
+    client_ip = req.client.host
+    log_request("MARK-ATTENDANCE", client_ip, f"| finger_id={finger_id}")
+
+    user = db.query(User).filter(User.finger_id == finger_id).first()
+
+    if not user:
+        return PlainTextResponse("user_not_found")
+
+    if user.status != FingerprintStatus.ENROLLED:
+        return PlainTextResponse("not_enrolled")
+
+    # Find ongoing event
+    today = date.today()
+
+    events = db.query(Event).filter(Event.event_date == today).all()
+
+    ongoing_event = None
+    now = datetime.now().time()
+
+    for event in events:
+        if event.start_time <= now <= event.end_time:
+            ongoing_event = event
+            break
+
+    if not ongoing_event:
+        return PlainTextResponse("no_active_event")
+
+    # Prevent duplicate attendance for same event
+    existing = (
+        db.query(Attendance)
+        .filter(Attendance.user_id == user.id)
+        .filter(Attendance.event_id == ongoing_event.id)
+        .first()
+    )
+
+    if existing:
+        return PlainTextResponse("already_marked")
+
+    new_attendance = Attendance(
+        user_id=user.id,
+        event_id=ongoing_event.id,
+        status=AttendanceStatus.PRESENT,
+        attendance_time=datetime.now(),
+    )
+
+    db.add(new_attendance)
+
+    try:
+        db.commit()
+        db.refresh(new_attendance)
+    except Exception as e:
+        db.rollback()
+        return PlainTextResponse("database_error")
+
+    return PlainTextResponse("attendance_marked")
+
+
+# ------------------- DEVICE MODE FOR ESP32 -------------------
+@router.get("/device-mode")
+def get_device_mode():
+    """
+    ESP32 polls this endpoint to determine the current mode:
+    - 'idle': no enrollment in progress
+    - 'enroll': an enrollment is in progress
+    - 'attendance': attendance mode
+    """
+    global device_mode
+    return PlainTextResponse(device_mode)

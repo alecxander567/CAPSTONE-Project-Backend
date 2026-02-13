@@ -28,7 +28,9 @@ UPLOAD_DIR = Path("uploads/profile_pictures")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+
+# 5MB
+MAX_FILE_SIZE = 5 * 1024 * 1024
 
 
 # ------------------- REGISTER -------------------
@@ -36,7 +38,8 @@ MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
     "/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED
 )
 def register_user(user: UserCreate, db: Session = Depends(get_db)):
-    # Check if mobile phone already exists
+    from app.models.programs import Program
+
     existing_mobile = (
         db.query(User).filter(User.mobile_phone == user.mobile_phone).first()
     )
@@ -50,13 +53,41 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
         if existing_student:
             raise HTTPException(status_code=400, detail="Student ID already registered")
 
+    # ------------------- ASSIGN PROGRAM AND YEAR LEVEL -------------------
+    program_id = user.program_id
+    year_level = user.year_level
+
+    if user.role == UserRole.ADMIN:
+
+        # Admin automatically gets OSA program
+        osa_program = db.query(Program).filter(Program.code == "OSA").first()
+        if not osa_program:
+            osa_program = Program(code="OSA", name="OSA Head")
+            db.add(osa_program)
+            db.commit()
+            db.refresh(osa_program)
+        program_id = osa_program.id
+
+        # Admin doesn't need year level
+        year_level = None
+
+    elif user.role == UserRole.STUDENT:
+        if not program_id:
+            raise HTTPException(
+                status_code=400, detail="Program is required for students"
+            )
+        if not year_level:
+            raise HTTPException(
+                status_code=400, detail="Year level is required for students"
+            )
+
     new_user = User(
         student_id_no=user.student_id_no,
         first_name=user.first_name,
         last_name=user.last_name,
         middle_initial=user.middle_initial,
-        program=user.program,
-        year_level=user.year_level,
+        program_id=program_id,
+        year_level=year_level,
         mobile_phone=user.mobile_phone,
         password=hash_password(user.password),
         role=user.role,
@@ -160,11 +191,11 @@ def update_user_profile(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    from app.models.programs import Program
 
     if not current_user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Check for mobile phone uniqueness
     if (
         profile_data.mobile_phone
         and profile_data.mobile_phone != current_user.mobile_phone
@@ -180,7 +211,6 @@ def update_user_profile(
         if existing_mobile:
             raise HTTPException(status_code=400, detail="Mobile phone already in use")
 
-    # Map numeric year_level to string enum
     year_level_map = {1: "FIRST", 2: "SECOND", 3: "THIRD", 4: "FOURTH"}
 
     # Update only the fields that are provided
@@ -192,8 +222,15 @@ def update_user_profile(
         current_user.middle_initial = profile_data.middle_initial
     if profile_data.mobile_phone is not None:
         current_user.mobile_phone = profile_data.mobile_phone
+
     if profile_data.program is not None:
-        current_user.program = profile_data.program
+        program = db.query(Program).filter(Program.code == profile_data.program).first()
+        if not program:
+            raise HTTPException(
+                status_code=400, detail=f"Program '{profile_data.program}' not found"
+            )
+        current_user.program_id = program.id
+
     if profile_data.profile_image is not None:
         current_user.profile_image = profile_data.profile_image
     if profile_data.year_level is not None:
