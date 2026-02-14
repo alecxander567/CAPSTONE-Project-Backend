@@ -15,7 +15,7 @@ router = APIRouter(prefix="/attendance", tags=["Attendance"])
 # ------------------- UPDATE ATTENDANCE STATUS -------------------
 class AttendanceUpdateRequest(BaseModel):
     student_id_no: str
-    status: str  # Only "Present" allowed for now
+    status: str  
 
 
 @router.post("/update-status")
@@ -55,10 +55,8 @@ def update_attendance_status(
     )
 
     if attendance:
-        # Update status if needed
         attendance.status = AttendanceStatus.PRESENT
     else:
-        # Create new attendance
         attendance = Attendance(
             user_id=user.id,
             event_id=ongoing_event.id,
