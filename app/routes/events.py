@@ -35,6 +35,7 @@ def create_event(
         start_time=event.start_time,
         end_time=event.end_time,
         location=event.location,
+        program_id=event.program_id,  
         created_by=current_user.id,
     )
 
@@ -74,7 +75,6 @@ def update_event(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-
     if current_user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -110,7 +110,6 @@ def delete_event(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-
     if current_user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -124,9 +123,7 @@ def delete_event(
             detail="Event not found",
         )
 
-    # Delete all attendance records for this event first
     db.query(Attendance).filter(Attendance.event_id == event_id).delete()
-
     db.delete(event)
     db.commit()
 

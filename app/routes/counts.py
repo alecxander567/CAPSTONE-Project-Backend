@@ -143,3 +143,9 @@ def delete_program(
     db.commit()
 
     return {"message": "Program deleted successfully"}
+
+
+# ------------------- GET ALL PROGRAMS -------------------
+@router.get("/")
+def get_all_programs(db: Session = Depends(get_db)):
+    return db.query(Program).filter(Program.code != "OSA").all()

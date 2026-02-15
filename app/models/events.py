@@ -26,10 +26,13 @@ class Event(Base):
 
     location = Column(String(255), nullable=False)
 
+    program_id = Column(Integer, ForeignKey("programs.id"), nullable=True)
+
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     notifications = relationship("Notification", back_populates="event")
+    program = relationship("Program", foreign_keys=[program_id])
 
     @property
     def status(self) -> EventStatus:

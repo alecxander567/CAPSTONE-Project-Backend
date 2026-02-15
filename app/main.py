@@ -4,7 +4,15 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from app.core.database import engine, Base
 from app.models.user import User
-from app.routes import auth, counts, events, notification, fingerprint, attendance
+from app.routes import (
+    auth,
+    counts,
+    events,
+    notification,
+    fingerprint,
+    attendance,
+    device,
+)
 from app.routes.notification_ws import websocket_endpoint
 from app.core.background_task import event_notifier_loop
 import asyncio
@@ -41,6 +49,7 @@ app.include_router(notification.router)
 app.include_router(fingerprint.router)
 app.include_router(attendance.router)
 app.websocket("/ws/notifications/")(websocket_endpoint)
+app.include_router(device.router)
 
 
 @app.on_event("startup")

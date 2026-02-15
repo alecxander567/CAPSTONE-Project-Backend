@@ -11,6 +11,7 @@ class EventBase(BaseModel):
     start_time: time
     end_time: time
     location: str
+    program_id: Optional[int] = None  
 
 
 class EventCreate(EventBase):
@@ -37,6 +38,7 @@ class EventUpdate(BaseModel):
     start_time: Optional[time] = None
     end_time: Optional[time] = None
     location: Optional[str] = None
+    program_id: Optional[int] = None 
 
     @field_validator("event_date")
     @classmethod

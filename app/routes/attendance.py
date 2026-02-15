@@ -80,15 +80,12 @@ def get_attendance_updates(db: Session = Depends(get_db)):
     today = date.today()
     now = datetime.now().time()
 
-    # Log the request occasionally for debugging
     if not hasattr(get_attendance_updates, "call_count"):
         get_attendance_updates.call_count = 0
     get_attendance_updates.call_count += 1
 
     if get_attendance_updates.call_count % 20 == 1:
-        print(
-            f"[{datetime.now().strftime('%H:%M:%S')}] Attendance updates requested (call #{get_attendance_updates.call_count})"
-        )
+        pass
 
     ongoing_event = (
         db.query(Event)
@@ -128,3 +125,84 @@ def get_attendance_updates(db: Session = Depends(get_db)):
         pass
 
     return result
+
+
+# ------------------- GET ATTENDANCE COUNT PER EVENT -------------------
+@router.get("/per-event")
+def get_attendance_per_event(db: Session = Depends(get_db)):
+    """Return attendance count for each event, ordered by event date"""
+    events = (
+        db.query(Event).order_by(Event.event_date.asc(), Event.start_time.asc()).all()
+    )
+
+    result = []
+    for event in events:
+        count = (
+            db.query(Attendance)
+            .filter(Attendance.event_id == event.id)
+            .filter(Attendance.status == AttendanceStatus.PRESENT)
+            .count()
+        )
+        result.append(
+            {
+                "event": event.title,
+                "event_date": event.event_date.strftime("%b %d"),
+                "students": count,
+            }
+        )
+
+    return result
+
+
+# ------------------- GET ATTENDANCE COUNT PER PROGRAM -------------------
+@router.get("/per-program")
+def get_attendance_per_program(db: Session = Depends(get_db)):
+    """Return present attendance count grouped by program"""
+    from app.models.programs import Program
+
+    programs = db.query(Program).all()
+
+    result = []
+    for program in programs:
+        count = (
+            db.query(Attendance)
+            .join(User, Attendance.user_id == User.id)
+            .filter(User.program_id == program.id)
+            .filter(Attendance.status == AttendanceStatus.PRESENT)
+            .count()
+        )
+        result.append(
+            {
+                "program": program.name,
+                "code": program.code,
+                "students": count,
+            }
+        )
+
+    return result
+
+
+# ------------------- GET ATTENDANCE BY EVENT -------------------
+@router.get("/by-event/{event_id}")
+def get_attendance_by_event(event_id: int, db: Session = Depends(get_db)):
+    """Return attendance records for a specific event"""
+    records = (
+        db.query(Attendance, User)
+        .join(User, Attendance.user_id == User.id)
+        .filter(Attendance.event_id == event_id)
+        .all()
+    )
+
+    return [
+        {
+            "student_id_no": user.student_id_no,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "program_id": user.program_id,
+            "status": record.status.value,
+            "attendance_time": (
+                record.attendance_time.isoformat() if record.attendance_time else None
+            ),
+        }
+        for record, user in records
+    ]

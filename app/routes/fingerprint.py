@@ -9,11 +9,9 @@ from datetime import datetime
 from app.models.attendance import Attendance, AttendanceStatus
 from app.models.events import Event
 from datetime import datetime, date
+from app.models.device import DeviceState
 
 router = APIRouter(prefix="/fingerprints", tags=["Fingerprints"])
-
-device_mode = "idle"
-pending_delete_id = None
 
 
 class EnrollmentRequest(BaseModel):
@@ -24,6 +22,17 @@ def log_request(endpoint: str, client_ip: str, extra: str = ""):
     timestamp = datetime.now().strftime("%H:%M:%S")
 
 
+def get_device_state(db: Session) -> DeviceState:
+    """Get or create device state from database"""
+    state = db.query(DeviceState).filter(DeviceState.id == 1).first()
+    if not state:
+        state = DeviceState(id=1, mode="idle", pending_delete_id=None)
+        db.add(state)
+        db.commit()
+        db.refresh(state)
+    return state
+
+
 # ------------------- START ENROLLMENT -------------------
 @router.post("/start-enrollment")
 def start_enrollment(
@@ -31,8 +40,6 @@ def start_enrollment(
     req: Request,
     db: Session = Depends(get_db),
 ):
-    global device_mode
-
     client_ip = req.client.host
     log_request("START-ENROLLMENT", client_ip, f"| user_id={request.user_id}")
 
@@ -71,7 +78,10 @@ def start_enrollment(
         db.commit()
         db.refresh(user)
 
-        device_mode = "enroll"
+        # Set device mode to enroll using database
+        state = get_device_state(db)
+        state.mode = "enroll"
+        db.commit()
 
     except Exception as e:
         db.rollback()
@@ -132,8 +142,6 @@ def update_enrollment(
     status: str,
     db: Session = Depends(get_db),
 ):
-    global device_mode
-
     client_ip = req.client.host
     log_request("UPDATE-ENROLLMENT", client_ip, f"| finger_id={id} | status={status}")
 
@@ -174,8 +182,11 @@ def update_enrollment(
         db.commit()
         db.refresh(user)
 
+        # Reset device mode to idle when enrollment/deletion completes
         if status in ["success", "error", "delete_success", "delete_error"]:
-            device_mode = "idle"
+            state = get_device_state(db)
+            state.mode = "idle"
+            db.commit()
 
     except Exception as e:
         db.rollback()
@@ -251,8 +262,6 @@ def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
 @router.post("/unenroll-fingerprint/{user_id}")
 def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_db)):
     """Unenroll a user's fingerprint from the system"""
-    global device_mode, pending_delete_id
-
     client_ip = req.client.host
     log_request("UNENROLL-FINGERPRINT", client_ip, f"| user_id={user_id}")
 
@@ -267,10 +276,11 @@ def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_d
     if not user.finger_id:
         raise HTTPException(status_code=400, detail="User has no finger_id")
 
-    # Store the finger_id for ESP32 to delete
-    pending_delete_id = user.finger_id
-
-    device_mode = "delete"
+    # Store the finger_id for ESP32 to delete in database
+    state = get_device_state(db)
+    state.pending_delete_id = user.finger_id
+    state.mode = "delete"
+    db.commit()
 
     return {
         "message": "Unenrollment started",
@@ -280,15 +290,16 @@ def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_d
 
 # ------------------- ESP32 POLLS FOR PENDING DELETE -------------------
 @router.get("/check-delete")
-def check_delete(req: Request):
-    global pending_delete_id
-
+def check_delete(req: Request, db: Session = Depends(get_db)):
     client_ip = req.client.host
     log_request("CHECK-DELETE", client_ip)
 
-    if pending_delete_id is not None:
-        finger_id = pending_delete_id
-        pending_delete_id = None
+    state = get_device_state(db)
+
+    if state.pending_delete_id is not None:
+        finger_id = state.pending_delete_id
+        state.pending_delete_id = None
+        db.commit()
         return PlainTextResponse(str(finger_id))
 
     return PlainTextResponse("none")
@@ -312,17 +323,19 @@ def debug_enrollment(finger_id: int, db: Session = Depends(get_db)):
 
 # ------------------- START ATTENDANCE -------------------
 @router.post("/start-attendance")
-def start_attendance():
-    global device_mode
-    device_mode = "attendance"
+def start_attendance(db: Session = Depends(get_db)):
+    state = get_device_state(db)
+    state.mode = "attendance"
+    db.commit()
     return {"message": "Attendance mode started"}
 
 
 # ------------------- STOP ATTENDANCE -------------------
 @router.post("/stop-attendance")
-def stop_attendance():
-    global device_mode
-    device_mode = "idle"
+def stop_attendance(db: Session = Depends(get_db)):
+    state = get_device_state(db)
+    state.mode = "idle"
+    db.commit()
     return {"message": "Attendance mode stopped"}
 
 
@@ -355,13 +368,17 @@ def mark_attendance(
     ongoing_event = None
 
     for event in events:
-        print(f"      - Event: {event.title} | {event.start_time} to {event.end_time}")
         if event.start_time <= now <= event.end_time:
             ongoing_event = event
             break
 
     if not ongoing_event:
         return PlainTextResponse("no_active_event")
+
+    # If event is program-specific, reject students from other programs
+    if ongoing_event.program_id is not None:
+        if user.program_id != ongoing_event.program_id:
+            return PlainTextResponse("wrong_program")
 
     # Check for existing attendance
     existing = (
@@ -396,7 +413,7 @@ def mark_attendance(
 
 # ------------------- DEVICE MODE FOR ESP32 -------------------
 @router.get("/device-mode")
-def get_device_mode():
+def get_device_mode(db: Session = Depends(get_db)):
     """
     ESP32 polls this endpoint to determine the current mode:
     - 'idle': no enrollment in progress
@@ -404,5 +421,5 @@ def get_device_mode():
     - 'attendance': attendance mode
     - 'delete': fingerprint deletion in progress
     """
-    global device_mode
-    return PlainTextResponse(device_mode)
+    state = get_device_state(db)
+    return PlainTextResponse(state.mode)
