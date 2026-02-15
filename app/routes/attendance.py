@@ -15,7 +15,7 @@ router = APIRouter(prefix="/attendance", tags=["Attendance"])
 # ------------------- UPDATE ATTENDANCE STATUS -------------------
 class AttendanceUpdateRequest(BaseModel):
     student_id_no: str
-    status: str  
+    status: str
 
 
 @router.post("/update-status")
@@ -100,11 +100,11 @@ def get_attendance_updates(db: Session = Depends(get_db)):
 
     if not ongoing_event:
         if get_attendance_updates.call_count % 20 == 1:
-            print(f"   → No ongoing event found for today")
+            pass
         return []
 
     if get_attendance_updates.call_count % 20 == 1:
-        print(f"   → Found event: {ongoing_event.title} (ID: {ongoing_event.id})")
+        pass
 
     attendance_records = (
         db.query(Attendance, User)
@@ -114,11 +114,17 @@ def get_attendance_updates(db: Session = Depends(get_db)):
     )
 
     result = [
-        {"student_id_no": user.student_id_no, "status": record.status.value}
+        {
+            "student_id_no": user.student_id_no,
+            "status": record.status.value,
+            "time": (
+                record.attendance_time.isoformat() if record.attendance_time else None
+            ),
+        }
         for record, user in attendance_records
     ]
 
     if get_attendance_updates.call_count % 20 == 1:
-        print(f"   → Returning {len(result)} attendance records")
+        pass
 
     return result
