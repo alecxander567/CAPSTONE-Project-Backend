@@ -48,10 +48,14 @@ class User(Base):
     program_id = Column(Integer, ForeignKey("programs.id"), nullable=True)
     program = relationship("Program", back_populates="users")
     role = Column(
-        Enum(UserRole, native_enum=False), nullable=False, default=UserRole.STUDENT
+        Enum(
+            UserRole, native_enum=False, values_callable=lambda x: [e.value for e in x]
+        ),
+        nullable=False,
+        default=UserRole.STUDENT,
     )
 
-    year_level = Column(Enum(YearLevel), nullable=True)
+    year_level = Column(Enum(YearLevel, native_enum=False), nullable=True)
 
     mobile_phone = Column(String(20), unique=True, index=True, nullable=False)
     profile_image = Column(String(255), nullable=True)
@@ -60,13 +64,21 @@ class User(Base):
     finger_id = Column(Integer, unique=True, nullable=True)
 
     enroll_status = Column(
-        Enum(EnrollmentStep),
+        Enum(
+            EnrollmentStep,
+            native_enum=False,
+            values_callable=lambda x: [e.value for e in x],
+        ),
         default=EnrollmentStep.NOT_ENROLLED,
         nullable=False,
     )
 
     status = Column(
-        Enum(FingerprintStatus),
+        Enum(
+            FingerprintStatus,
+            native_enum=False,
+            values_callable=lambda x: [e.value for e in x],
+        ),
         default=FingerprintStatus.NOT_ENROLLED,
         nullable=False,
     )

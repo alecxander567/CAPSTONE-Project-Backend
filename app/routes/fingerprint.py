@@ -1,14 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.user import User, FingerprintStatus, EnrollmentStep
 from fastapi.responses import PlainTextResponse
 import random
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, date
 from app.models.attendance import Attendance, AttendanceStatus
 from app.models.events import Event
-from datetime import datetime, date
 from app.models.device import DeviceState
 
 router = APIRouter(prefix="/fingerprints", tags=["Fingerprints"])
@@ -23,7 +22,7 @@ def log_request(endpoint: str, client_ip: str, extra: str = ""):
 
 
 def get_device_state(db: Session) -> DeviceState:
-    """Get or create device state from database"""
+    """Get or create device state. Does NOT call expire_all — callers handle that."""
     state = db.query(DeviceState).filter(DeviceState.id == 1).first()
     if not state:
         state = DeviceState(id=1, mode="idle", pending_delete_id=None)
@@ -47,22 +46,11 @@ def start_enrollment(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Clean up any previous failed/completed enrollments
-    if user.status in [FingerprintStatus.ENROLLED, FingerprintStatus.FAILED]:
+    # Always reset previous enrollment state — no more stuck pending
+    if user.status != FingerprintStatus.NOT_ENROLLED:
         user.finger_id = None
         user.enroll_status = EnrollmentStep.NOT_ENROLLED
         user.status = FingerprintStatus.NOT_ENROLLED
-
-    if (
-        user.status == FingerprintStatus.PENDING
-        and user.enroll_status != EnrollmentStep.NOT_ENROLLED
-    ):
-        return {
-            "message": "Enrollment already in progress",
-            "finger_id": user.finger_id,
-            "status": user.status.value,
-            "step": user.enroll_status.value,
-        }
 
     # Generate new finger_id
     existing_ids = {u.finger_id for u in db.query(User.finger_id).all() if u.finger_id}
@@ -70,19 +58,18 @@ def start_enrollment(
     while finger_id in existing_ids:
         finger_id = random.randint(1, 127)
 
+    # Set user fields
     user.finger_id = finger_id
     user.enroll_status = EnrollmentStep.PENDING
     user.status = FingerprintStatus.PENDING
 
+    state = get_device_state(db)
+    state.mode = "enroll"
+
     try:
         db.commit()
         db.refresh(user)
-
-        # Set device mode to enroll using database
-        state = get_device_state(db)
-        state.mode = "enroll"
-        db.commit()
-
+        db.refresh(state)
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
@@ -99,7 +86,6 @@ def start_enrollment(
 @router.get("/check-enrollment")
 def check_enrollment(req: Request, db: Session = Depends(get_db)):
     client_ip = req.client.host
-    log_request("CHECK-ENROLLMENT", client_ip)
 
     user = (
         db.query(User)
@@ -110,6 +96,9 @@ def check_enrollment(req: Request, db: Session = Depends(get_db)):
     )
 
     if user:
+        log_request(
+            "CHECK-ENROLLMENT", client_ip, f"| Found finger_id={user.finger_id}"
+        )
         return PlainTextResponse(str(user.finger_id))
 
     user = (
@@ -129,6 +118,9 @@ def check_enrollment(req: Request, db: Session = Depends(get_db)):
     )
 
     if user:
+        log_request(
+            "CHECK-ENROLLMENT", client_ip, f"| Resuming finger_id={user.finger_id}"
+        )
         return PlainTextResponse(str(user.finger_id))
 
     return PlainTextResponse("none")
@@ -149,7 +141,6 @@ def update_enrollment(
         return PlainTextResponse("invalid_id")
 
     user = db.query(User).filter(User.finger_id == id).first()
-
     if not user:
         return PlainTextResponse("error")
 
@@ -178,16 +169,12 @@ def update_enrollment(
         user.enroll_status = enroll_step
         user.status = fingerprint_status
 
+    if status in ["success", "error", "delete_success", "delete_error"]:
+        state = get_device_state(db)
+        state.mode = "idle"
+
     try:
         db.commit()
-        db.refresh(user)
-
-        # Reset device mode to idle when enrollment/deletion completes
-        if status in ["success", "error", "delete_success", "delete_error"]:
-            state = get_device_state(db)
-            state.mode = "idle"
-            db.commit()
-
     except Exception as e:
         db.rollback()
         return PlainTextResponse("error")
@@ -214,37 +201,27 @@ def get_status(
     user = db.query(User).filter(User.finger_id == finger_id).first()
 
     if not user:
-        if get_status.call_count % 10 == 1:
-            pass
         return {"status": "failed", "step": "error", "message": "User not found"}
 
     step = user.enroll_status.value if user.enroll_status else "pending"
 
-    result = {
+    return {
         "status": user.status.value,
         "step": step,
     }
-
-    if get_status.call_count % 10 == 1:
-        pass
-
-    return result
 
 
 # ------------------- RESET ENROLLMENT -------------------
 @router.post("/reset-enrollment/{user_id}")
 def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
-    """Reset user's enrollment status to allow re-enrollment"""
     client_ip = req.client.host
     log_request("RESET-ENROLLMENT", client_ip, f"| user_id={user_id}")
 
     user = db.query(User).filter(User.id == user_id).first()
-
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     old_status = user.status.value if user.status else "none"
-
     user.finger_id = None
     user.enroll_status = EnrollmentStep.NOT_ENROLLED
     user.status = FingerprintStatus.NOT_ENROLLED
@@ -261,26 +238,29 @@ def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
 # ------------------- UNENROLL FINGERPRINT -------------------
 @router.post("/unenroll-fingerprint/{user_id}")
 def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_db)):
-    """Unenroll a user's fingerprint from the system"""
     client_ip = req.client.host
     log_request("UNENROLL-FINGERPRINT", client_ip, f"| user_id={user_id}")
 
     user = db.query(User).filter(User.id == user_id).first()
-
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-
     if user.status != FingerprintStatus.ENROLLED:
         raise HTTPException(status_code=400, detail="User is not enrolled")
-
     if not user.finger_id:
         raise HTTPException(status_code=400, detail="User has no finger_id")
 
-    # Store the finger_id for ESP32 to delete in database
     state = get_device_state(db)
+    print(f"   Device state BEFORE delete: mode={state.mode}")
     state.pending_delete_id = user.finger_id
     state.mode = "delete"
-    db.commit()
+
+    try:
+        db.commit()
+        db.refresh(state)
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
     return {
         "message": "Unenrollment started",
@@ -292,12 +272,12 @@ def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_d
 @router.get("/check-delete")
 def check_delete(req: Request, db: Session = Depends(get_db)):
     client_ip = req.client.host
-    log_request("CHECK-DELETE", client_ip)
 
     state = get_device_state(db)
 
     if state.pending_delete_id is not None:
         finger_id = state.pending_delete_id
+        log_request("CHECK-DELETE", client_ip, f"| Found finger_id={finger_id}")
         state.pending_delete_id = None
         db.commit()
         return PlainTextResponse(str(finger_id))
@@ -305,28 +285,16 @@ def check_delete(req: Request, db: Session = Depends(get_db)):
     return PlainTextResponse("none")
 
 
-# ------------------- DEBUG -------------------
-@router.get("/debug/{finger_id}")
-def debug_enrollment(finger_id: int, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.finger_id == finger_id).first()
-
-    if not user:
-        return {"error": f"No user with finger_id={finger_id}"}
-
-    return {
-        "user_id": user.id,
-        "finger_id": user.finger_id,
-        "status": user.status.value if user.status else None,
-        "enroll_status": user.enroll_status.value if user.enroll_status else None,
-    }
-
-
 # ------------------- START ATTENDANCE -------------------
 @router.post("/start-attendance")
 def start_attendance(db: Session = Depends(get_db)):
     state = get_device_state(db)
     state.mode = "attendance"
-    db.commit()
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     return {"message": "Attendance mode started"}
 
 
@@ -335,7 +303,11 @@ def start_attendance(db: Session = Depends(get_db)):
 def stop_attendance(db: Session = Depends(get_db)):
     state = get_device_state(db)
     state.mode = "idle"
-    db.commit()
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     return {"message": "Attendance mode stopped"}
 
 
@@ -349,24 +321,18 @@ def mark_attendance(
     client_ip = req.client.host
     log_request("MARK-ATTENDANCE", client_ip, f"| finger_id={finger_id}")
 
-    # Find user by finger_id
     user = db.query(User).filter(User.finger_id == finger_id).first()
-
     if not user:
-        pass
         return PlainTextResponse("user_not_found")
 
     if user.status != FingerprintStatus.ENROLLED:
         return PlainTextResponse("not_enrolled")
 
-    # Find ongoing event
     today = date.today()
     now = datetime.now().time()
-
     events = db.query(Event).filter(Event.event_date == today).all()
 
     ongoing_event = None
-
     for event in events:
         if event.start_time <= now <= event.end_time:
             ongoing_event = event
@@ -375,30 +341,25 @@ def mark_attendance(
     if not ongoing_event:
         return PlainTextResponse("no_active_event")
 
-    # If event is program-specific, reject students from other programs
     if ongoing_event.program_id is not None:
         if user.program_id != ongoing_event.program_id:
             return PlainTextResponse("wrong_program")
 
-    # Check for existing attendance
     existing = (
         db.query(Attendance)
         .filter(Attendance.user_id == user.id)
         .filter(Attendance.event_id == ongoing_event.id)
         .first()
     )
-
     if existing:
         return PlainTextResponse("already_marked")
 
-    # Create new attendance record
     new_attendance = Attendance(
         user_id=user.id,
         event_id=ongoing_event.id,
         status=AttendanceStatus.PRESENT,
         attendance_time=datetime.now(),
     )
-
     db.add(new_attendance)
 
     try:
@@ -416,10 +377,75 @@ def mark_attendance(
 def get_device_mode(db: Session = Depends(get_db)):
     """
     ESP32 polls this endpoint to determine the current mode:
-    - 'idle': no enrollment in progress
-    - 'enroll': an enrollment is in progress
-    - 'attendance': attendance mode
+    - 'idle': no operation in progress
+    - 'enroll': enrollment in progress
+    - 'attendance': attendance scanning mode
     - 'delete': fingerprint deletion in progress
     """
+    db.expire_all()
     state = get_device_state(db)
+
+    if not hasattr(get_device_mode, "call_count"):
+        get_device_mode.call_count = 0
+    get_device_mode.call_count += 1
+
+    if get_device_mode.call_count % 20 == 1 or state.mode != "idle":
+        pass
+
     return PlainTextResponse(state.mode)
+
+
+# ------------------- DEBUG ALL ENROLLED -------------------
+@router.get("/debug/all-enrolled")
+def debug_all_enrolled(db: Session = Depends(get_db)):
+    users = db.query(User).filter(User.status == FingerprintStatus.ENROLLED).all()
+    return [
+        {
+            "user_id": u.id,
+            "student_id_no": u.student_id_no,
+            "name": f"{u.first_name} {u.last_name}",
+            "finger_id": u.finger_id,
+            "status": u.status.value,
+            "enroll_status": u.enroll_status.value if u.enroll_status else None,
+        }
+        for u in users
+    ]
+
+
+# ------------------- DEBUG DEVICE STATE (MUST COME BEFORE /{finger_id}) -------------------
+@router.get("/debug/device-state")
+def debug_device_state(db: Session = Depends(get_db)):
+    db.expire_all()
+    state = get_device_state(db)
+    pending_users = (
+        db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
+    )
+    return {
+        "device_state": {
+            "mode": state.mode,
+            "pending_delete_id": state.pending_delete_id,
+        },
+        "pending_enrollments": [
+            {
+                "user_id": u.id,
+                "finger_id": u.finger_id,
+                "status": u.status.value,
+                "enroll_status": u.enroll_status.value if u.enroll_status else None,
+            }
+            for u in pending_users
+        ],
+    }
+
+
+# ------------------- DEBUG SINGLE FINGERPRINT (MUST BE LAST) -------------------
+@router.get("/debug/{finger_id}")
+def debug_enrollment(finger_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.finger_id == finger_id).first()
+    if not user:
+        return {"error": f"No user with finger_id={finger_id}"}
+    return {
+        "user_id": user.id,
+        "finger_id": user.finger_id,
+        "status": user.status.value if user.status else None,
+        "enroll_status": user.enroll_status.value if user.enroll_status else None,
+    }
