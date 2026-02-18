@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -57,10 +58,9 @@ async def start_background_tasks():
     asyncio.create_task(event_notifier_loop())
 
 
-# UptimeRobot ping endpoint
-@app.get("/ping", tags=["Health"])
-async def ping():
-    """
-    Simple endpoint for uptime monitoring services like UptimeRobot.
-    """
-    return {"status": "ok", "message": "Backend is alive!"}
+@app.api_route("/ping", methods=["GET", "POST"], tags=["Health"])
+async def ping(request: Request):
+    return {
+        "status": "ok",
+        "message": f"Backend is alive! Method used: {request.method}",
+    }
