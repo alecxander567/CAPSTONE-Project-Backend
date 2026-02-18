@@ -114,6 +114,7 @@ def get_attendance_updates(db: Session = Depends(get_db)):
         {
             "student_id_no": user.student_id_no,
             "status": record.status.value,
+            "year_level": user.year_level,
             "time": (
                 record.attendance_time.isoformat() if record.attendance_time else None
             ),

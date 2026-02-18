@@ -40,6 +40,25 @@ MAX_FILE_SIZE = 5 * 1024 * 1024
 def register_user(user: UserCreate, db: Session = Depends(get_db)):
     from app.models.programs import Program
 
+    # CHECK IF ADMIN EXISTS
+    existing_admin = db.query(User).filter(User.role == UserRole.ADMIN).first()
+
+    if existing_admin:
+        # If admin already exists → force role to STUDENT
+        if user.role == UserRole.ADMIN:
+            raise HTTPException(
+                status_code=403,
+                detail="Administrator account already exists. Only students can register.",
+            )
+    else:
+        # If no admin exists → allow first admin only
+        if user.role != UserRole.ADMIN:
+            raise HTTPException(
+                status_code=403,
+                detail="First registered account must be an administrator.",
+            )
+
+    # MOBILE CHECK 
     existing_mobile = (
         db.query(User).filter(User.mobile_phone == user.mobile_phone).first()
     )
@@ -53,22 +72,19 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
         if existing_student:
             raise HTTPException(status_code=400, detail="Student ID already registered")
 
-    # ------------------- ASSIGN PROGRAM AND YEAR LEVEL -------------------
+    # ASSIGN PROGRAM AND YEAR LEVEL 
     program_id = user.program_id
     year_level = user.year_level
 
     if user.role == UserRole.ADMIN:
-
-        # Admin automatically gets OSA program
         osa_program = db.query(Program).filter(Program.code == "OSA").first()
         if not osa_program:
             osa_program = Program(code="OSA", name="OSA Head")
             db.add(osa_program)
             db.commit()
             db.refresh(osa_program)
-        program_id = osa_program.id
 
-        # Admin doesn't need year level
+        program_id = osa_program.id
         year_level = None
 
     elif user.role == UserRole.STUDENT:
@@ -310,3 +326,10 @@ def delete_profile_picture(
     db.commit()
 
     return {"message": "Profile picture deleted successfully"}
+
+
+# ------------------- CHECK IF ADMIN ACCOUNT ALREADY EXIST -------------------
+@router.get("/admin-exists")
+def check_admin_exists(db: Session = Depends(get_db)):
+    admin = db.query(User).filter(User.role == UserRole.ADMIN).first()
+    return {"exists": bool(admin)}
