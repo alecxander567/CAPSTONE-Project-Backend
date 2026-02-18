@@ -361,7 +361,7 @@ def mark_attendance(
         user_id=user.id,
         event_id=ongoing_event.id,
         status=AttendanceStatus.PRESENT,
-        attendance_time=datetime.now(ph_tz),
+        attendance_time=datetime.now(ph_tz).replace(tzinfo=None),
     )
     db.add(new_attendance)
 
