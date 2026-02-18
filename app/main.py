@@ -55,3 +55,12 @@ app.include_router(device.router)
 @app.on_event("startup")
 async def start_background_tasks():
     asyncio.create_task(event_notifier_loop())
+
+
+# UptimeRobot ping endpoint
+@app.get("/ping", tags=["Health"])
+async def ping():
+    """
+    Simple endpoint for uptime monitoring services like UptimeRobot.
+    """
+    return {"status": "ok", "message": "Backend is alive!"}
