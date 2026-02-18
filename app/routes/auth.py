@@ -18,7 +18,6 @@ from datetime import datetime, timedelta
 import secrets
 from app.models.password_reset import PasswordReset
 from app.schemas.auth import ForgotPasswordSchema, ResetPasswordSchema
-from app.core.mail import send_email
 
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -58,7 +57,7 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
                 detail="First registered account must be an administrator.",
             )
 
-    # MOBILE CHECK 
+    # MOBILE CHECK
     existing_mobile = (
         db.query(User).filter(User.mobile_phone == user.mobile_phone).first()
     )
@@ -72,7 +71,7 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
         if existing_student:
             raise HTTPException(status_code=400, detail="Student ID already registered")
 
-    # ASSIGN PROGRAM AND YEAR LEVEL 
+    # ASSIGN PROGRAM AND YEAR LEVEL
     program_id = user.program_id
     year_level = user.year_level
 
