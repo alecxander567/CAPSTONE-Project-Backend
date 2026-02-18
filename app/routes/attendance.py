@@ -7,9 +7,11 @@ from app.models.user import User, FingerprintStatus
 from app.models.attendance import Attendance, AttendanceStatus
 from app.models.events import Event
 from pydantic import BaseModel
-
+import pytz
 
 router = APIRouter(prefix="/attendance", tags=["Attendance"])
+
+ph_tz = pytz.timezone("Asia/Manila")
 
 
 # ------------------- UPDATE ATTENDANCE STATUS -------------------
@@ -32,8 +34,9 @@ def update_attendance_status(
         raise HTTPException(status_code=400, detail="Student not enrolled")
 
     # Find ongoing event for today
-    today = date.today()
-    now = datetime.now().time()
+    ph_now = datetime.now(ph_tz)
+    today = ph_now.date()
+    now = ph_now.time()
 
     ongoing_event = (
         db.query(Event)
@@ -61,7 +64,7 @@ def update_attendance_status(
             user_id=user.id,
             event_id=ongoing_event.id,
             status=AttendanceStatus.PRESENT,
-            attendance_time=datetime.now(),
+            attendance_time=datetime.now(ph_tz),
         )
         db.add(attendance)
 
@@ -77,8 +80,9 @@ def update_attendance_status(
 @router.get("/updates")
 def get_attendance_updates(db: Session = Depends(get_db)):
     """Return all attendance for ongoing event"""
-    today = date.today()
-    now = datetime.now().time()
+    ph_now = datetime.now(ph_tz)
+    today = ph_now.date()
+    now = ph_now.time()
 
     if not hasattr(get_attendance_updates, "call_count"):
         get_attendance_updates.call_count = 0

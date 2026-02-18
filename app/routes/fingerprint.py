@@ -9,8 +9,11 @@ from datetime import datetime, date
 from app.models.attendance import Attendance, AttendanceStatus
 from app.models.events import Event
 from app.models.device import DeviceState
+import pytz
 
 router = APIRouter(prefix="/fingerprints", tags=["Fingerprints"])
+
+ph_tz = pytz.timezone("Asia/Manila")
 
 
 class EnrollmentRequest(BaseModel):
@@ -327,8 +330,9 @@ def mark_attendance(
     if user.status != FingerprintStatus.ENROLLED:
         return PlainTextResponse("not_enrolled")
 
-    today = date.today()
-    now = datetime.now().time()
+    ph_now = datetime.now(ph_tz)
+    today = ph_now.date()
+    now = ph_now.time()
     events = db.query(Event).filter(Event.event_date == today).all()
 
     ongoing_event = None
@@ -357,7 +361,7 @@ def mark_attendance(
         user_id=user.id,
         event_id=ongoing_event.id,
         status=AttendanceStatus.PRESENT,
-        attendance_time=datetime.now(),
+        attendance_time=datetime.now(ph_tz),
     )
     db.add(new_attendance)
 
