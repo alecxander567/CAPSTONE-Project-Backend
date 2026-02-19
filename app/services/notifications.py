@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.models import Notification, Event, User
@@ -10,9 +10,14 @@ logger = logging.getLogger(__name__)
 
 _sent_notifications = set()
 
+# Philippine Time (UTC+8)
+PH_TZ = timezone(timedelta(hours=8))
+
 
 def notify_today_events(db: Session):
-    now = datetime.now()
+    now = datetime.now(PH_TZ).replace(
+        tzinfo=None
+    )  # ✅ PH time, strip tzinfo for comparison
     today = now.date()
 
     events_today = db.query(Event).filter(Event.event_date == today).all()
@@ -23,7 +28,7 @@ def notify_today_events(db: Session):
 
     for event in events_today:
         event_datetime = datetime.combine(event.event_date, event.start_time)
-        time_diff = (event_datetime - datetime.now()).total_seconds()
+        time_diff = (event_datetime - now).total_seconds()
 
         if not (-60 < time_diff <= 120):
             continue
