@@ -226,7 +226,7 @@ def update_user_profile(
         if existing_mobile:
             raise HTTPException(status_code=400, detail="Mobile phone already in use")
 
-    year_level_map = {1: "FIRST", 2: "SECOND", 3: "THIRD", 4: "FOURTH"}
+    year_level_map = {"1": "FIRST", "2": "SECOND", "3": "THIRD", "4": "FOURTH"}
 
     # Update only the fields that are provided
     if profile_data.first_name is not None:
