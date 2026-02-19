@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.models import Notification, Event, User
 import logging
-from app.services.sms_service import send_sms
+from app.services.firebase_service import send_push_notification
 import threading
 
 logger = logging.getLogger(__name__)
@@ -75,15 +75,15 @@ def notify_today_events(db: Session):
                     f"Notification {notification.id} created for user {user.id}, event {event.id}"
                 )
 
-                if user.mobile_phone:
-                    sms_message = (
-                        f"EVENT REMINDER: {event.title}\n"
-                        f"Starting in 2 minutes at {event.start_time.strftime('%I:%M %p')}\n"
-                        f"{event.description}"
-                    )
+                # Replace the SMS block with this:
+                if user.device_token:
                     threading.Thread(
-                        target=send_sms,
-                        args=(user.mobile_phone, sms_message),
+                        target=send_push_notification,
+                        args=(
+                            user.device_token,
+                            f"EVENT REMINDER: {event.title}",
+                            f"Starting in 2 minutes at {event.start_time.strftime('%I:%M %p')}\n{event.description}",
+                        ),
                         daemon=True,
                     ).start()
 

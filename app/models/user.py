@@ -58,6 +58,7 @@ class User(Base):
     year_level = Column(Enum(YearLevel, native_enum=False), nullable=True)
 
     mobile_phone = Column(String(20), unique=True, index=True, nullable=False)
+    device_token = Column(String(255), nullable=True)
     profile_image = Column(String(255), nullable=True)
     password = Column(String(255), nullable=False)
 
