@@ -3,6 +3,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.models import Notification, Event, User
 import logging
+from app.services.sms_service import send_sms
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -10,12 +12,6 @@ _sent_notifications = set()
 
 
 def notify_today_events(db: Session):
-    """
-    Check for events happening today and create notifications.
-    Uses in-memory cache and database constraints to prevent duplicates.
-
-    NOTE: This is now a SYNC function (no async) since we removed WebSocket.
-    """
     now = datetime.now()
     today = now.date()
 
@@ -27,19 +23,15 @@ def notify_today_events(db: Session):
 
     for event in events_today:
         event_datetime = datetime.combine(event.event_date, event.start_time)
-        current_datetime = datetime.now()
-        time_diff = (event_datetime - current_datetime).total_seconds()
+        time_diff = (event_datetime - datetime.now()).total_seconds()
 
-        if not (0 < time_diff <= 120):
+        if not (-60 < time_diff <= 120):
             continue
 
         for user in users:
             notification_key = f"event_{event.id}_user_{user.id}"
 
             if notification_key in _sent_notifications:
-                logger.debug(
-                    f"Skipping duplicate notification (cached): {notification_key}"
-                )
                 continue
 
             existing = (
@@ -54,7 +46,6 @@ def notify_today_events(db: Session):
 
             if existing:
                 _sent_notifications.add(notification_key)
-                logger.debug(f"Notification already exists in DB: {notification_key}")
                 continue
 
             notification = Notification(
@@ -75,16 +66,27 @@ def notify_today_events(db: Session):
                 db.refresh(notification)
 
                 _sent_notifications.add(notification_key)
-
                 logger.info(
-                    f"Created notification {notification.id} for user {user.id}, event {event.id}"
+                    f"Notification {notification.id} created for user {user.id}, event {event.id}"
                 )
 
-            except IntegrityError as e:
+                if user.mobile_phone:
+                    sms_message = (
+                        f"EVENT REMINDER: {event.title}\n"
+                        f"Starting in 2 minutes at {event.start_time.strftime('%I:%M %p')}\n"
+                        f"{event.description}"
+                    )
+                    threading.Thread(
+                        target=send_sms,
+                        args=(user.mobile_phone, sms_message),
+                        daemon=True,
+                    ).start()
+
+            except IntegrityError:
                 db.rollback()
                 _sent_notifications.add(notification_key)
                 logger.warning(
-                    f"Duplicate notification prevented by DB constraint: {notification_key}"
+                    f"Duplicate prevented by DB constraint: {notification_key}"
                 )
 
             except Exception as e:
@@ -93,10 +95,6 @@ def notify_today_events(db: Session):
 
 
 def clear_notification_cache():
-    """
-    Clear the in-memory notification cache.
-    Call this at midnight or when you want to allow notifications to be resent.
-    """
     global _sent_notifications
     count = len(_sent_notifications)
     _sent_notifications.clear()

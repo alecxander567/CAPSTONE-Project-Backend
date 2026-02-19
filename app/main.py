@@ -4,7 +4,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from app.core.database import engine, Base
-from app.models.user import User
 from app.routes import (
     auth,
     counts,
@@ -17,6 +16,13 @@ from app.routes import (
 from app.routes.notification_ws import websocket_endpoint
 from app.core.background_task import event_notifier_loop
 import asyncio
+
+import logging
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
 
 app = FastAPI(title="ARA Biometric Attendance System", version="1.0.0")
 
