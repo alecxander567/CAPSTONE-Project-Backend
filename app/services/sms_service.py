@@ -1,12 +1,13 @@
 # app/services/sms_service.py
-import requests
 import logging
 import os
+from twilio.rest import Client
 
 logger = logging.getLogger(__name__)
 
-SMS_API_URL = "https://sms-api-ph-gceo.onrender.com/send/sms"
-SMS_API_KEY = os.getenv("SMS_API_KEY")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
 
 def normalize_ph_number(number: str) -> str:
@@ -20,38 +21,24 @@ def normalize_ph_number(number: str) -> str:
 
 
 def send_sms(phone_number: str, message: str) -> bool:
-    if not SMS_API_KEY:
-        logger.error("SMS_API_KEY is not set in environment variables")
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER]):
+        logger.error("Twilio credentials are not set in environment variables")
         return False
 
     phone_number = normalize_ph_number(phone_number)
 
     try:
-        response = requests.post(
-            SMS_API_URL,
-            headers={
-                "x-api-key": SMS_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json={
-                "recipient": phone_number,
-                "message": message,
-            },
-            timeout=30,
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+        msg = client.messages.create(
+            body=message,
+            from_=TWILIO_PHONE_NUMBER,
+            to=phone_number,
         )
 
-        data = response.json()
+        logger.info(f"SMS sent to {phone_number} — SID: {msg.sid}")
+        return True
 
-        if response.status_code == 200 and data.get("success"):
-            logger.info(f"SMS sent to {phone_number}")
-            return True
-        else:
-            logger.warning(f"SMS failed for {phone_number}: {data}")
-            return False
-
-    except requests.exceptions.Timeout:
-        logger.error(f"SMS timeout for {phone_number}")
-        return False
     except Exception as e:
         logger.error(f"SMS error for {phone_number}: {e}")
         return False
