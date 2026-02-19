@@ -16,7 +16,7 @@ def normalize_ph_number(number: str) -> str:
         return "+63" + number[1:]
     if number.startswith("9") and len(number) == 10:
         return "+63" + number
-    return number  # Already in +639 format
+    return number  
 
 
 def send_sms(phone_number: str, message: str) -> bool:

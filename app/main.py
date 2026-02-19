@@ -3,6 +3,7 @@ from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
+from contextlib import asynccontextmanager
 from app.core.database import engine, Base
 from app.routes import (
     auth,
@@ -16,7 +17,6 @@ from app.routes import (
 from app.routes.notification_ws import websocket_endpoint
 from app.core.background_task import event_notifier_loop
 import asyncio
-
 import logging
 
 logging.basicConfig(
@@ -24,7 +24,15 @@ logging.basicConfig(
 )
 
 
-app = FastAPI(title="ARA Biometric Attendance System", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(event_notifier_loop())
+    yield
+
+
+app = FastAPI(
+    title="ARA Biometric Attendance System", version="1.0.0", lifespan=lifespan
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,7 +40,6 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
-        "https://aras-bt-system.netlify.app/",
         "https://ara-system-app.vercel.app",
     ],
     allow_credentials=True,
@@ -57,11 +64,6 @@ app.include_router(fingerprint.router)
 app.include_router(attendance.router)
 app.websocket("/ws/notifications/")(websocket_endpoint)
 app.include_router(device.router)
-
-
-@app.on_event("startup")
-async def start_background_tasks():
-    asyncio.create_task(event_notifier_loop())
 
 
 @app.api_route("/ping", methods=["GET", "POST"], tags=["Health"])
