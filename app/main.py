@@ -26,7 +26,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
-        "http://127.0.0.1:3000",
+        "https://aras-bt-system.netlify.app",
         "https://ara-system-app.vercel.app",
     ],
     allow_credentials=True,
