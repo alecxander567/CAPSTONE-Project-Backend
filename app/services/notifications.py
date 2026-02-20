@@ -30,7 +30,7 @@ def notify_today_events(db: Session):
         event_datetime = datetime.combine(event.event_date, event.start_time)
         time_diff = (event_datetime - now).total_seconds()
 
-        if not (-60 < time_diff <= 300):  # 5 minutes = 300 seconds
+        if not (-60 < time_diff <= 1800):  
             continue
 
         for user in users:
