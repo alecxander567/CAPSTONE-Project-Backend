@@ -15,11 +15,9 @@ def init_firebase():
     if not _initialized:
         cred_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
         if cred_json:
-            # Production: load from base64 environment variable
             cred_dict = json.loads(base64.b64decode(cred_json))
             cred = credentials.Certificate(cred_dict)
         else:
-            # Local: load from file
             cred_path = os.getenv(
                 "FIREBASE_CREDENTIALS_PATH", "app/core/firebase-adminsdk.json"
             )

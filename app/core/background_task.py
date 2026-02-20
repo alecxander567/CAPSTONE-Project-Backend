@@ -34,5 +34,4 @@ async def event_notifier_loop():
 
             traceback.print_exc()
 
-        # Wait 60 seconds before next check
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)

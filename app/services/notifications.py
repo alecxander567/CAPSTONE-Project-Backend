@@ -17,7 +17,7 @@ PH_TZ = timezone(timedelta(hours=8))
 def notify_today_events(db: Session):
     now = datetime.now(PH_TZ).replace(
         tzinfo=None
-    )  # ✅ PH time, strip tzinfo for comparison
+    )  # PH time, strip tzinfo for comparison
     today = now.date()
 
     events_today = db.query(Event).filter(Event.event_date == today).all()
@@ -30,7 +30,7 @@ def notify_today_events(db: Session):
         event_datetime = datetime.combine(event.event_date, event.start_time)
         time_diff = (event_datetime - now).total_seconds()
 
-        if not (-60 < time_diff <= 120):
+        if not (-60 < time_diff <= 300):  # 5 minutes = 300 seconds
             continue
 
         for user in users:
@@ -75,14 +75,13 @@ def notify_today_events(db: Session):
                     f"Notification {notification.id} created for user {user.id}, event {event.id}"
                 )
 
-                # Replace the SMS block with this:
                 if user.device_token:
                     threading.Thread(
                         target=send_push_notification,
                         args=(
                             user.device_token,
                             f"EVENT REMINDER: {event.title}",
-                            f"Starting in 2 minutes at {event.start_time.strftime('%I:%M %p')}\n{event.description}",
+                            f"Starting in 5 minutes at {event.start_time.strftime('%I:%M %p')}\n{event.description}",
                         ),
                         daemon=True,
                     ).start()
