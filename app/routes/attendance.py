@@ -211,3 +211,45 @@ def get_attendance_by_event(event_id: int, db: Session = Depends(get_db)):
         }
         for record, user in records
     ]
+
+
+# ------------------- GET STUDENTS WITH 3+ ABSENCES -------------------
+@router.get("/at-risk")
+def get_at_risk_students(db: Session = Depends(get_db)):
+    """Return students who have 3 or more absences across all events"""
+    from app.models.programs import Program
+
+    total_events = db.query(Event).count()
+
+    if total_events == 0:
+        return []
+
+    users = db.query(User).filter(User.status == FingerprintStatus.ENROLLED).all()
+
+    result = []
+    for user in users:
+        present_count = (
+            db.query(Attendance)
+            .filter(Attendance.user_id == user.id)
+            .filter(Attendance.status == AttendanceStatus.PRESENT)
+            .count()
+        )
+        absences = total_events - present_count
+
+        if absences >= 3:
+            program = db.query(Program).filter(Program.id == user.program_id).first()
+            result.append(
+                {
+                    "student_id_no": user.student_id_no,
+                    "first_name": user.first_name,
+                    "last_name": user.last_name,
+                    "program": program.name if program else "N/A",
+                    "program_code": program.code if program else "N/A",
+                    "absences": absences,
+                    "present": present_count,
+                    "total_events": total_events,
+                }
+            )
+
+    result.sort(key=lambda x: x["absences"], reverse=True)
+    return result
