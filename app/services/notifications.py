@@ -15,9 +15,7 @@ PH_TZ = timezone(timedelta(hours=8))
 
 
 def notify_today_events(db: Session):
-    now = datetime.now(PH_TZ).replace(
-        tzinfo=None
-    )  # PH time, strip tzinfo for comparison
+    now = datetime.now(PH_TZ).replace(tzinfo=None)
     today = now.date()
 
     events_today = db.query(Event).filter(Event.event_date == today).all()
@@ -30,8 +28,11 @@ def notify_today_events(db: Session):
         event_datetime = datetime.combine(event.event_date, event.start_time)
         time_diff = (event_datetime - now).total_seconds()
 
-        if not (-60 < time_diff <= 1800):  
+        # Only notify within 30 mins before event
+        if not (-60 < time_diff <= 1800):
             continue
+
+        sent_tokens = set()
 
         for user in users:
             notification_key = f"event_{event.id}_user_{user.id}"
@@ -39,6 +40,7 @@ def notify_today_events(db: Session):
             if notification_key in _sent_notifications:
                 continue
 
+            # Check if notification already exists (DB protection)
             existing = (
                 db.query(Notification)
                 .filter(
@@ -71,11 +73,14 @@ def notify_today_events(db: Session):
                 db.refresh(notification)
 
                 _sent_notifications.add(notification_key)
+
                 logger.info(
                     f"Notification {notification.id} created for user {user.id}, event {event.id}"
                 )
 
-                if user.device_token:
+                if user.device_token and user.device_token not in sent_tokens:
+                    sent_tokens.add(user.device_token)
+
                     threading.Thread(
                         target=send_push_notification,
                         args=(

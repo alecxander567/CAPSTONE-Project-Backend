@@ -26,8 +26,15 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    asyncio.create_task(event_notifier_loop())
-    yield
+    notifier_task = asyncio.create_task(event_notifier_loop())
+    try:
+        yield
+    finally:
+        notifier_task.cancel()
+        try:
+            await notifier_task
+        except asyncio.CancelledError:
+            logging.info("Notifier loop cancelled cleanly")
 
 
 app = FastAPI(
