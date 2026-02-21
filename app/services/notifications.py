@@ -81,12 +81,14 @@ def notify_today_events(db: Session):
                 if user.device_token and user.device_token not in sent_tokens:
                     sent_tokens.add(user.device_token)
 
+                    minutes_remaining = max(1, int(time_diff // 60))
+
                     threading.Thread(
                         target=send_push_notification,
                         args=(
                             user.device_token,
                             f"EVENT REMINDER: {event.title}",
-                            f"Starting in 5 minutes at {event.start_time.strftime('%I:%M %p')}\n{event.description}",
+                            f"Starting in {minutes_remaining} minute{'s' if minutes_remaining != 1 else ''} at {event.start_time.strftime('%I:%M %p')}\n{event.description}",
                         ),
                         daemon=True,
                     ).start()
