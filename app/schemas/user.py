@@ -35,8 +35,8 @@ class UserResponse(BaseModel):
 
     @field_validator("program", mode="before")
     @classmethod
-    def extract_program_code(cls, v):  
-        if hasattr(v, "code"): 
+    def extract_program_code(cls, v):
+        if hasattr(v, "code"):
             return v.code
         return v
 
@@ -55,7 +55,7 @@ class UserProfileUpdate(BaseModel):
     middle_initial: Optional[str] = None
     mobile_phone: Optional[str] = None
     program: Optional[str] = None
-    year_level: int | None = None  
+    year_level: Optional[str] = None
     profile_image: Optional[str] = None
 
     class Config:
