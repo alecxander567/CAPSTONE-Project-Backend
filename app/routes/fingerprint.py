@@ -10,6 +10,8 @@ from app.models.attendance import Attendance, AttendanceStatus
 from app.models.events import Event
 from app.models.device import DeviceState
 import pytz
+from app.routes.device import last_heartbeat
+from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/fingerprints", tags=["Fingerprints"])
 
@@ -247,12 +249,24 @@ def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_d
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
     if user.status != FingerprintStatus.ENROLLED:
         raise HTTPException(status_code=400, detail="User is not enrolled")
+
     if not user.finger_id:
         raise HTTPException(status_code=400, detail="User has no finger_id")
 
     state = get_device_state(db)
+
+    # Check if device is online
+    if not state.last_seen or datetime.utcnow() - state.last_seen > timedelta(
+        seconds=10
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="ESP32 device is offline. Cannot unenroll fingerprint.",
+        )
+
     state.pending_delete_id = user.finger_id
     state.mode = "delete"
 

@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, String, Boolean
+from sqlalchemy import Column, Integer, String, Boolean, DateTime
+from datetime import datetime
 from app.core.database import Base
 
 
@@ -10,4 +11,5 @@ class DeviceState(Base):
     pending_delete_id = Column(Integer, nullable=True)
     recognition_finger_id = Column(Integer, nullable=True)
     recognition_matched = Column(Boolean, nullable=True)
-    recognition_target_id = Column(Integer, nullable=True) 
+    recognition_target_id = Column(Integer, nullable=True)
+    last_seen = Column(DateTime, nullable=True)
