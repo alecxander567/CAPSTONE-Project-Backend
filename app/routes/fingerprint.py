@@ -415,6 +415,13 @@ def start_recognition(user_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="User not enrolled")
 
     state = get_device_state(db)
+
+    # Check if device is online based on last_seen timestamp
+    if not state.last_seen or datetime.utcnow() - state.last_seen > timedelta(
+        seconds=10
+    ):
+        raise HTTPException(status_code=503, detail="ESP32 device offline")
+
     state.mode = "recognize"
     state.recognition_target_id = user.finger_id
     state.recognition_finger_id = None
