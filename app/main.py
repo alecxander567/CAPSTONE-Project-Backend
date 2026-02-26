@@ -18,7 +18,7 @@ from app.routes.notification_ws import websocket_endpoint
 from app.core.background_task import event_notifier_loop
 import asyncio
 import logging
-from app.routes import health
+from app.routes.health import health
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
