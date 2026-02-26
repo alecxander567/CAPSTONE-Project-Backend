@@ -15,6 +15,8 @@ router = APIRouter(prefix="/fingerprints", tags=["Fingerprints"])
 
 ph_tz = pytz.timezone("Asia/Manila")
 
+MAX_FINGERPRINTS = 1000
+
 
 class EnrollmentRequest(BaseModel):
     user_id: int
@@ -66,9 +68,12 @@ def start_enrollment(
 
     # Generate new finger_id
     existing_ids = {u.finger_id for u in db.query(User.finger_id).all() if u.finger_id}
-    finger_id = random.randint(1, 127)
-    while finger_id in existing_ids:
-        finger_id = random.randint(1, 127)
+
+    if len(existing_ids) >= MAX_FINGERPRINTS:
+        raise HTTPException(status_code=400, detail="Fingerprint storage is full")
+
+    available_ids = set(range(1, MAX_FINGERPRINTS + 1)) - existing_ids
+    finger_id = random.choice(list(available_ids))
 
     # Set user fields
     user.finger_id = finger_id
