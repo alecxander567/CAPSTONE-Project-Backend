@@ -162,25 +162,47 @@ def get_attendance_per_event(db: Session = Depends(get_db)):
 # ------------------- GET ATTENDANCE COUNT PER PROGRAM -------------------
 @router.get("/per-program")
 def get_attendance_per_program(db: Session = Depends(get_db)):
-    """Return present attendance count grouped by program"""
+    """
+    Return attendance percentage per program
+    (present students ÷ total enrolled students in that program)
+    """
+
     from app.models.programs import Program
 
     programs = db.query(Program).all()
 
     result = []
+
     for program in programs:
-        count = (
+        total_students = (
+            db.query(User)
+            .filter(User.program_id == program.id)
+            .filter(User.status == FingerprintStatus.ENROLLED)
+            .count()
+        )
+
+        # Present students in this program (for ongoing event)
+        present_students = (
             db.query(Attendance)
             .join(User, Attendance.user_id == User.id)
             .filter(User.program_id == program.id)
             .filter(Attendance.status == AttendanceStatus.PRESENT)
             .count()
         )
+
+        percentage = (
+            round((present_students / total_students) * 100)
+            if total_students > 0
+            else 0
+        )
+
         result.append(
             {
                 "program": program.name,
                 "code": program.code,
-                "students": count,
+                "present": present_students,
+                "total_students": total_students,
+                "percentage": percentage,
             }
         )
 
