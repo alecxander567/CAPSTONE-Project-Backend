@@ -457,11 +457,13 @@ def recognition_result(
         return PlainTextResponse("error")
 
     target = state.recognition_target_id
+
+    # matched=true means the sensor found a fingerprint; check if it's the right one
     actual_match = matched and (finger_id == target)
 
     state.mode = "idle"
     state.recognition_matched = actual_match
-    state.recognition_finger_id = target
+    state.recognition_finger_id = target  # store target so frontend poll can find it
     state.recognition_target_id = None
 
     try:
