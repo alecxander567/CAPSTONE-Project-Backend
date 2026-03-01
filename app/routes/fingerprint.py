@@ -70,9 +70,9 @@ def start_enrollment(
     if len(existing_ids) >= 127:
         raise HTTPException(status_code=400, detail="Fingerprint storage is full")
 
-    finger_id = random.randint(1, 1000)
+    finger_id = random.randint(1, 127)
     while finger_id in existing_ids:
-        finger_id = random.randint(1, 1000)
+        finger_id = random.randint(1, 127)
 
     # Set user fields
     user.finger_id = finger_id
