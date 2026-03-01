@@ -67,12 +67,12 @@ def start_enrollment(
     # Generate new finger_id
     existing_ids = {u.finger_id for u in db.query(User.finger_id).all() if u.finger_id}
 
-    if len(existing_ids) > 127:
+    if len(existing_ids) > 1000:
         raise HTTPException(status_code=400, detail="Fingerprint storage is full")
 
-    finger_id = random.randint(1, 127)
+    finger_id = random.randint(1, 1000)
     while finger_id in existing_ids:
-        finger_id = random.randint(1, 127)
+        finger_id = random.randint(1, 1000)
 
     # Set user fields
     user.finger_id = finger_id
