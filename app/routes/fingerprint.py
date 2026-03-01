@@ -360,16 +360,31 @@ def mark_attendance(
     ph_now = datetime.now(ph_tz)
     today = ph_now.date()
     now = ph_now.time()
+    print(f"[MARK-ATTENDANCE] now={now} today={today}")
+
     events = db.query(Event).filter(Event.event_date == today).all()
+    print(
+        f"[MARK-ATTENDANCE] events today: {[(e.id, e.start_time, e.end_time) for e in events]}"
+    )
 
     ongoing_event = None
     for event in events:
+        print(
+            f"[MARK-ATTENDANCE] checking event id={event.id} start={event.start_time} end={event.end_time} match={event.start_time <= now <= event.end_time}"
+        )
         if event.start_time <= now <= event.end_time:
             ongoing_event = event
             break
 
     if not ongoing_event:
+        print(f"[MARK-ATTENDANCE] no active event found for now={now}")
         return PlainTextResponse("no_active_event")
+
+    log_request(
+        "MARK-ATTENDANCE",
+        client_ip,
+        f"| finger_id={finger_id} | saving to event_id={ongoing_event.id}",
+    )
 
     if ongoing_event.program_id is not None:
         if user.program_id != ongoing_event.program_id:
