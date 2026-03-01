@@ -67,7 +67,7 @@ def start_enrollment(
     # Generate new finger_id
     existing_ids = {u.finger_id for u in db.query(User.finger_id).all() if u.finger_id}
 
-    if len(existing_ids) >= 1000:
+    if len(existing_ids) >= 127:
         raise HTTPException(status_code=400, detail="Fingerprint storage is full")
 
     finger_id = random.randint(1, 1000)
@@ -457,11 +457,13 @@ def recognition_result(
         return PlainTextResponse("error")
 
     target = state.recognition_target_id
+
+    # matched=true means the sensor found a fingerprint; check if it's the right one
     actual_match = matched and (finger_id == target)
 
     state.mode = "idle"
     state.recognition_matched = actual_match
-    state.recognition_finger_id = target
+    state.recognition_finger_id = target  # store target so frontend poll can find it
     state.recognition_target_id = None
 
     try:
