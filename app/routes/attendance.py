@@ -78,43 +78,37 @@ def update_attendance_status(
 
 # ------------------- GET CURRENT ATTENDANCE STATUS -------------------
 @router.get("/updates")
-def get_attendance_updates(db: Session = Depends(get_db)):
-    """Return all attendance for ongoing event"""
-    ph_now = datetime.now(ph_tz)
-    today = ph_now.date()
-    now = ph_now.time()
+def get_attendance_updates(event_id: int | None = None, db: Session = Depends(get_db)):
+    """Return all attendance for ongoing event or a specific event"""
 
-    if not hasattr(get_attendance_updates, "call_count"):
-        get_attendance_updates.call_count = 0
-    get_attendance_updates.call_count += 1
+    if event_id:
+        target_event = db.query(Event).filter(Event.id == event_id).first()
+        if not target_event:
+            return []
+    else:
+        ph_now = datetime.now(ph_tz)
+        today = ph_now.date()
+        now = ph_now.time()
 
-    if get_attendance_updates.call_count % 20 == 1:
-        pass
+        target_event = (
+            db.query(Event)
+            .filter(Event.event_date == today)
+            .filter(Event.start_time <= now)
+            .filter(Event.end_time >= now)
+            .first()
+        )
 
-    ongoing_event = (
-        db.query(Event)
-        .filter(Event.event_date == today)
-        .filter(Event.start_time <= now)
-        .filter(Event.end_time >= now)
-        .first()
-    )
-
-    if not ongoing_event:
-        if get_attendance_updates.call_count % 20 == 1:
-            pass
-        return []
-
-    if get_attendance_updates.call_count % 20 == 1:
-        pass
+        if not target_event:
+            return []
 
     attendance_records = (
         db.query(Attendance, User)
         .join(User, Attendance.user_id == User.id)
-        .filter(Attendance.event_id == ongoing_event.id)
+        .filter(Attendance.event_id == target_event.id)
         .all()
     )
 
-    result = [
+    return [
         {
             "student_id_no": user.student_id_no,
             "status": record.status.value,
@@ -125,11 +119,6 @@ def get_attendance_updates(db: Session = Depends(get_db)):
         }
         for record, user in attendance_records
     ]
-
-    if get_attendance_updates.call_count % 20 == 1:
-        pass
-
-    return result
 
 
 # ------------------- GET ATTENDANCE COUNT PER EVENT -------------------
