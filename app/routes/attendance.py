@@ -122,30 +122,29 @@ def get_attendance_updates(event_id: int | None = None, db: Session = Depends(ge
 
 
 # ------------------- GET ATTENDANCE COUNT PER EVENT -------------------
-@router.get("/per-event")
-def get_attendance_per_event(db: Session = Depends(get_db)):
-    """Return attendance count for each event, ordered by event date"""
-    events = (
-        db.query(Event).order_by(Event.event_date.asc(), Event.start_time.asc()).all()
+@router.get("/by-event/{event_id}")
+def get_attendance_by_event(event_id: int, db: Session = Depends(get_db)):
+    records = (
+        db.query(Attendance, User)
+        .join(User, Attendance.user_id == User.id)
+        .filter(Attendance.event_id == event_id)
+        .all()
     )
 
-    result = []
-    for event in events:
-        count = (
-            db.query(Attendance)
-            .filter(Attendance.event_id == event.id)
-            .filter(Attendance.status == AttendanceStatus.PRESENT)
-            .count()
-        )
-        result.append(
-            {
-                "event": event.title,
-                "event_date": event.event_date.strftime("%b %d"),
-                "students": count,
-            }
-        )
-
-    return result
+    return [
+        {
+            "student_id_no": user.student_id_no,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "program_id": user.program_id,
+            "year_level": (user.year_level.value if user.year_level else None),
+            "status": record.status.value,
+            "attendance_time": (
+                record.attendance_time.isoformat() if record.attendance_time else None
+            ),
+        }
+        for record, user in records
+    ]
 
 
 # ------------------- GET ATTENDANCE COUNT PER PROGRAM -------------------
