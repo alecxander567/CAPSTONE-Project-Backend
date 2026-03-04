@@ -150,15 +150,16 @@ def get_attendance_by_event(event_id: int, db: Session = Depends(get_db)):
 # ------------------- GET ATTENDANCE COUNT PER PROGRAM -------------------
 @router.get("/per-program")
 def get_attendance_per_program(db: Session = Depends(get_db)):
-    """
-    Return attendance percentage per program
-    (present students ÷ total enrolled students in that program)
-    """
-
     from app.models.programs import Program
 
-    programs = db.query(Program).all()
+    # Use the most recent event instead of all-time counts
+    latest_event = (
+        db.query(Event)
+        .order_by(Event.event_date.desc(), Event.start_time.desc())
+        .first()
+    )
 
+    programs = db.query(Program).all()
     result = []
 
     for program in programs:
@@ -169,14 +170,16 @@ def get_attendance_per_program(db: Session = Depends(get_db)):
             .count()
         )
 
-        # Present students in this program (for ongoing event)
-        present_students = (
-            db.query(Attendance)
-            .join(User, Attendance.user_id == User.id)
-            .filter(User.program_id == program.id)
-            .filter(Attendance.status == AttendanceStatus.PRESENT)
-            .count()
-        )
+        present_students = 0
+        if latest_event:
+            present_students = (
+                db.query(Attendance)
+                .join(User, Attendance.user_id == User.id)
+                .filter(User.program_id == program.id)
+                .filter(Attendance.event_id == latest_event.id)
+                .filter(Attendance.status == AttendanceStatus.PRESENT)
+                .count()
+            )
 
         percentage = (
             round((present_students / total_students) * 100)
@@ -191,6 +194,7 @@ def get_attendance_per_program(db: Session = Depends(get_db)):
                 "present": present_students,
                 "total_students": total_students,
                 "percentage": percentage,
+                "event": latest_event.title if latest_event else None,
             }
         )
 
@@ -260,6 +264,43 @@ def get_at_risk_students(db: Session = Depends(get_db)):
                     "total_events": total_events,
                 }
             )
+
+    result.sort(key=lambda x: x["absences"], reverse=True)
+    return result
+
+
+# ------------------- GET STUDENTS ATTENDANCE -------------------
+@router.get("/all-students-attendance")
+def get_all_students_attendance(db: Session = Depends(get_db)):
+    """Return all enrolled students with their attendance summary across all events"""
+    from app.models.programs import Program
+
+    total_events = db.query(Event).count()
+    users = db.query(User).filter(User.status == FingerprintStatus.ENROLLED).all()
+
+    result = []
+    for user in users:
+        present_count = (
+            db.query(Attendance)
+            .filter(Attendance.user_id == user.id)
+            .filter(Attendance.status == AttendanceStatus.PRESENT)
+            .count()
+        )
+        absences = total_events - present_count
+        program = db.query(Program).filter(Program.id == user.program_id).first()
+
+        result.append(
+            {
+                "student_id_no": user.student_id_no,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "program": program.name if program else "N/A",
+                "program_code": program.code if program else "N/A",
+                "absences": absences,
+                "present": present_count,
+                "total_events": total_events,
+            }
+        )
 
     result.sort(key=lambda x: x["absences"], reverse=True)
     return result
