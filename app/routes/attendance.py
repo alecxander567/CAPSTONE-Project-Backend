@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi.responses import JSONResponse
 from app.core.database import get_db
 from app.models.user import User, FingerprintStatus
@@ -13,6 +13,8 @@ import pytz
 router = APIRouter(prefix="/attendance", tags=["Attendance"])
 
 ph_tz = pytz.timezone("Asia/Manila")
+
+EARLY_WINDOW_MINUTES = 30
 
 
 # ------------------- UPDATE ATTENDANCE STATUS -------------------
@@ -35,15 +37,26 @@ def update_attendance_status(
 
     ph_now = datetime.now(ph_tz)
     today = ph_now.date()
-    now = ph_now.time()
 
-    ongoing_event = (
-        db.query(Event)
-        .filter(Event.event_date == today)
-        .filter(Event.start_time <= now)
-        .filter(Event.end_time >= now)
-        .first()
-    )
+    events = db.query(Event).filter(Event.event_date == today).all()
+
+    # Match same 30-minute early window logic as fingerprints.py
+    ongoing_event = None
+    for event in events:
+        event_start = datetime.combine(today, event.start_time).replace(tzinfo=ph_tz)
+        minutes_until_start = (event_start - ph_now).total_seconds() / 60
+
+        if minutes_until_start <= EARLY_WINDOW_MINUTES:
+            if ongoing_event is None:
+                ongoing_event = event
+            else:
+                current_start = datetime.combine(
+                    today, ongoing_event.start_time
+                ).replace(tzinfo=ph_tz)
+                if abs((event_start - ph_now).total_seconds()) < abs(
+                    (current_start - ph_now).total_seconds()
+                ):
+                    ongoing_event = event
 
     if not ongoing_event:
         raise HTTPException(status_code=400, detail="No active event")
@@ -84,15 +97,26 @@ def get_attendance_updates(event_id: int | None = None, db: Session = Depends(ge
     else:
         ph_now = datetime.now(ph_tz)
         today = ph_now.date()
-        now = ph_now.time()
 
-        target_event = (
-            db.query(Event)
-            .filter(Event.event_date == today)
-            .filter(Event.start_time <= now)
-            .filter(Event.end_time >= now)
-            .first()
-        )
+        events = db.query(Event).filter(Event.event_date == today).all()
+
+        target_event = None
+        for event in events:
+            event_start = datetime.combine(today, event.start_time).replace(
+                tzinfo=ph_tz
+            )
+            minutes_until_start = (event_start - ph_now).total_seconds() / 60
+            if minutes_until_start <= EARLY_WINDOW_MINUTES:
+                if target_event is None:
+                    target_event = event
+                else:
+                    current_start = datetime.combine(
+                        today, target_event.start_time
+                    ).replace(tzinfo=ph_tz)
+                    if abs((event_start - ph_now).total_seconds()) < abs(
+                        (current_start - ph_now).total_seconds()
+                    ):
+                        target_event = event
 
         if not target_event:
             return []
