@@ -362,9 +362,28 @@ def mark_attendance(
 
     events = db.query(Event).filter(Event.event_date == today).all()
 
+    # Pick the best matching event:
+    # Accept events whose start_time is within 30 minutes in the future
+    # OR have already started (start_time <= now).
+    # Among multiple candidates, prefer the one closest to now.
+    EARLY_WINDOW_MINUTES = 30
     ongoing_event = None
-    if events:
-        ongoing_event = events[0]
+
+    for event in events:
+        event_start = datetime.combine(today, event.start_time).replace(tzinfo=ph_tz)
+        minutes_until_start = (event_start - ph_now).total_seconds() / 60
+
+        if minutes_until_start <= EARLY_WINDOW_MINUTES:
+            if ongoing_event is None:
+                ongoing_event = event
+            else:
+                current_start = datetime.combine(
+                    today, ongoing_event.start_time
+                ).replace(tzinfo=ph_tz)
+                if abs((event_start - ph_now).total_seconds()) < abs(
+                    (current_start - ph_now).total_seconds()
+                ):
+                    ongoing_event = event
 
     if not ongoing_event:
         return PlainTextResponse("no_active_event")

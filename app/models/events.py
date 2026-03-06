@@ -2,7 +2,7 @@ from sqlalchemy import Column, Integer, String, Text, Date, Time, DateTime, Fore
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.core.database import Base
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from enum import Enum
 
 
@@ -43,10 +43,15 @@ class Event(Base):
             return EventStatus.DONE
 
         if self.event_date == today:
-            if self.start_time <= now.time() <= self.end_time:
-                return EventStatus.ONGOING
             if now.time() > self.end_time:
                 return EventStatus.DONE
+
+            event_start_dt = datetime.combine(today, self.start_time)
+            early_threshold = (event_start_dt - timedelta(minutes=30)).time()
+
+            if early_threshold <= now.time() <= self.end_time:
+                return EventStatus.ONGOING
+
             return EventStatus.UPCOMING
 
         return EventStatus.UPCOMING
