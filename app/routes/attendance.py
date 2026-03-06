@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from datetime import datetime
 from fastapi.responses import JSONResponse
 from app.core.database import get_db
 from app.models.user import User, FingerprintStatus
@@ -13,8 +13,6 @@ import pytz
 router = APIRouter(prefix="/attendance", tags=["Attendance"])
 
 ph_tz = pytz.timezone("Asia/Manila")
-
-EARLY_WINDOW_MINUTES = 30
 
 
 # ------------------- UPDATE ATTENDANCE STATUS -------------------
@@ -37,26 +35,15 @@ def update_attendance_status(
 
     ph_now = datetime.now(ph_tz)
     today = ph_now.date()
+    now = ph_now.time()
 
-    events = db.query(Event).filter(Event.event_date == today).all()
-
-    # Match same 30-minute early window logic as fingerprints.py
-    ongoing_event = None
-    for event in events:
-        event_start = datetime.combine(today, event.start_time).replace(tzinfo=ph_tz)
-        minutes_until_start = (event_start - ph_now).total_seconds() / 60
-
-        if minutes_until_start <= EARLY_WINDOW_MINUTES:
-            if ongoing_event is None:
-                ongoing_event = event
-            else:
-                current_start = datetime.combine(
-                    today, ongoing_event.start_time
-                ).replace(tzinfo=ph_tz)
-                if abs((event_start - ph_now).total_seconds()) < abs(
-                    (current_start - ph_now).total_seconds()
-                ):
-                    ongoing_event = event
+    ongoing_event = (
+        db.query(Event)
+        .filter(Event.event_date == today)
+        .filter(Event.start_time <= now)
+        .filter(Event.end_time >= now)
+        .first()
+    )
 
     if not ongoing_event:
         raise HTTPException(status_code=400, detail="No active event")
@@ -97,26 +84,15 @@ def get_attendance_updates(event_id: int | None = None, db: Session = Depends(ge
     else:
         ph_now = datetime.now(ph_tz)
         today = ph_now.date()
+        now = ph_now.time()
 
-        events = db.query(Event).filter(Event.event_date == today).all()
-
-        target_event = None
-        for event in events:
-            event_start = datetime.combine(today, event.start_time).replace(
-                tzinfo=ph_tz
-            )
-            minutes_until_start = (event_start - ph_now).total_seconds() / 60
-            if minutes_until_start <= EARLY_WINDOW_MINUTES:
-                if target_event is None:
-                    target_event = event
-                else:
-                    current_start = datetime.combine(
-                        today, target_event.start_time
-                    ).replace(tzinfo=ph_tz)
-                    if abs((event_start - ph_now).total_seconds()) < abs(
-                        (current_start - ph_now).total_seconds()
-                    ):
-                        target_event = event
+        target_event = (
+            db.query(Event)
+            .filter(Event.event_date == today)
+            .filter(Event.start_time <= now)
+            .filter(Event.end_time >= now)
+            .first()
+        )
 
         if not target_event:
             return []
@@ -309,20 +285,3 @@ def get_at_risk_students(db: Session = Depends(get_db)):
 
     result.sort(key=lambda x: x["absences"], reverse=True)
     return result
-
-
-# ------------------- DEBUG: SEE ALL ATTENDANCE RECORDS -------------------
-@router.get("/debug/all")
-def debug_all_attendance(db: Session = Depends(get_db)):
-    records = db.query(Attendance, User).join(User, Attendance.user_id == User.id).all()
-    return [
-        {
-            "event_id": record.event_id,
-            "student_id_no": user.student_id_no,
-            "status": record.status.value,
-            "attendance_time": (
-                record.attendance_time.isoformat() if record.attendance_time else None
-            ),
-        }
-        for record, user in records
-    ]
