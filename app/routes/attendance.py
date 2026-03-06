@@ -309,3 +309,20 @@ def get_at_risk_students(db: Session = Depends(get_db)):
 
     result.sort(key=lambda x: x["absences"], reverse=True)
     return result
+
+
+# ------------------- DEBUG: SEE ALL ATTENDANCE RECORDS -------------------
+@router.get("/debug/all")
+def debug_all_attendance(db: Session = Depends(get_db)):
+    records = db.query(Attendance, User).join(User, Attendance.user_id == User.id).all()
+    return [
+        {
+            "event_id": record.event_id,
+            "student_id_no": user.student_id_no,
+            "status": record.status.value,
+            "attendance_time": (
+                record.attendance_time.isoformat() if record.attendance_time else None
+            ),
+        }
+        for record, user in records
+    ]
