@@ -9,6 +9,7 @@ from app.models.events import Event
 from app.models.programs import Program
 from pydantic import BaseModel
 import pytz
+from sqlalchemy import extract
 
 router = APIRouter(prefix="/attendance", tags=["Attendance"])
 
@@ -145,10 +146,13 @@ def get_attendance_by_event(event_id: int, db: Session = Depends(get_db)):
 
 # ------------------- GET ATTENDANCE PER EVENT (FOR CHARTS) -------------------
 @router.get("/per-event")
-def get_attendance_per_event(db: Session = Depends(get_db)):
-    events = (
-        db.query(Event).order_by(Event.event_date.asc(), Event.start_time.asc()).all()
-    )
+def get_attendance_per_event(year: int | None = None, db: Session = Depends(get_db)):
+    query = db.query(Event).order_by(Event.event_date.asc(), Event.start_time.asc())
+
+    if year:
+        query = query.filter(extract("year", Event.event_date) == year)
+
+    events = query.all()
 
     return [
         {
@@ -284,4 +288,31 @@ def get_at_risk_students(db: Session = Depends(get_db)):
             )
 
     result.sort(key=lambda x: x["absences"], reverse=True)
+    return result
+
+
+# ------------------- GET STUDENT POPULATION PER PROGRAM -------------------
+@router.get("/students-per-program")
+def get_students_per_program(db: Session = Depends(get_db)):
+    programs = db.query(Program).all()
+    result = []
+
+    for program in programs:
+        if "osa" in program.name.lower():
+            continue
+
+        count = (
+            db.query(User)
+            .filter(User.program_id == program.id)
+            .filter(User.status == FingerprintStatus.ENROLLED)
+            .count()
+        )
+
+        result.append(
+            {
+                "program": program.code,
+                "students": count,
+            }
+        )
+
     return result
