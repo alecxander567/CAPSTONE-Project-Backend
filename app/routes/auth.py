@@ -18,7 +18,9 @@ from datetime import datetime, timedelta
 import secrets
 from app.models.password_reset import PasswordReset
 from app.schemas.auth import ForgotPasswordSchema, ResetPasswordSchema
-
+from fastapi import Request, Header
+from app.core.security import blacklist_token
+from app.models.token_blacklist import TokenBlacklist
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -140,8 +142,25 @@ def login(login_data: UserLogin, db: Session = Depends(get_db)):
 
 # ------------------- LOGOUT -------------------
 @router.post("/logout")
-def logout():
-    return {"message": "Logged out successfully"}
+def logout(
+    request: Request, db: Session = Depends(get_db), authorization: str = Header(None)
+):
+    """Logout user by blacklisting their token"""
+    try:
+        # Extract token from Authorization header
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Invalid authorization header")
+
+        token = authorization.split(" ")[1]
+
+        # Add token to blacklist
+        blacklist_token(token, db)
+
+        return {"message": "Logged out successfully"}
+    except Exception as e:
+        # Still return success to frontend even if token extraction fails
+        # This ensures frontend still clears local storage
+        return {"message": "Logged out successfully"}
 
 
 # ------------------- FORGOT PASSWORD -------------------

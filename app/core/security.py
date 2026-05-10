@@ -9,6 +9,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models import User
+from datetime import datetime, timedelta
 
 # Load environment variables
 load_dotenv()
@@ -32,8 +33,14 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 # ------------------ JWT Functions ------------------
+ACCESS_TOKEN_EXPIRE_HOURS = 24
+
+
 def create_access_token(data: Dict) -> str:
     to_encode = data.copy()
+    # Add expiration claim
+    expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+    to_encode.update({"exp": expire})
     token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return token
 
@@ -42,6 +49,10 @@ def decode_access_token(token: str) -> Dict:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired"
+        )
     except jwt.InvalidTokenError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
@@ -84,3 +95,72 @@ def get_current_user(
         )
 
     return user
+
+
+# app/core/auth.py (add these functions)
+from app.models.token_blacklist import TokenBlacklist
+
+
+def is_token_blacklisted(token: str, db: Session) -> bool:
+    """Check if a token is in the blacklist"""
+    blacklisted = db.query(TokenBlacklist).filter(TokenBlacklist.token == token).first()
+    return blacklisted is not None
+
+
+def blacklist_token(token: str, db: Session):
+    """Add a token to the blacklist"""
+    blacklisted_token = TokenBlacklist(token=token)
+    db.add(blacklisted_token)
+    db.commit()
+
+
+# Update your get_current_user function
+def get_current_user(
+    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
+) -> User:
+    """Returns the full User object from database with blacklist check"""
+    # Check if token is blacklisted
+    if is_token_blacklisted(token, db):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been invalidated. Please login again.",
+        )
+
+    payload = decode_access_token(token)
+    user_id = payload.get("user_id")
+
+    if user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
+        )
+
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found"
+        )
+
+    return user
+
+
+# Also update get_current_user_dict
+def get_current_user_dict(
+    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
+):
+    """Returns user info as dictionary with blacklist check"""
+    # Check if token is blacklisted
+    if is_token_blacklisted(token, db):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been invalidated. Please login again.",
+        )
+
+    payload = decode_access_token(token)
+    user_id = payload.get("user_id")
+    role = payload.get("role")
+    if user_id is None or role is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
+        )
+    return {"user_id": user_id, "role": role}
