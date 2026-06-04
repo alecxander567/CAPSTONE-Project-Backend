@@ -21,6 +21,8 @@ from app.schemas.auth import ForgotPasswordSchema, ResetPasswordSchema
 from fastapi import Request, Header
 from app.core.security import blacklist_token
 from app.models.token_blacklist import TokenBlacklist
+import cloudinary
+import cloudinary.uploader
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -32,6 +34,13 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 
 # 5MB
 MAX_FILE_SIZE = 5 * 1024 * 1024
+
+cloudinary.config(
+    cloud_name=os.environ["CLOUDINARY_CLOUD_NAME"],
+    api_key=os.environ["CLOUDINARY_API_KEY"],
+    api_secret=os.environ["CLOUDINARY_API_SECRET"],
+    secure=True,
+)
 
 
 # ------------------- REGISTER -------------------
@@ -283,9 +292,6 @@ async def upload_profile_picture(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Upload a profile picture for the current user"""
-
-    # Validate file extension
     file_ext = Path(file.filename).suffix.lower()
     if file_ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -300,27 +306,35 @@ async def upload_profile_picture(
             detail=f"File too large. Maximum size: {MAX_FILE_SIZE / (1024*1024)}MB",
         )
 
-    await file.seek(0)
+    # Delete old Cloudinary image if it exists
+    if current_user.profile_image and "cloudinary.com" in current_user.profile_image:
+        try:
+            # Extract public_id from URL
+            # URL format: https://res.cloudinary.com/<cloud>/image/upload/v123/<public_id>.ext
+            url_path = current_user.profile_image.split("/upload/")[-1]
+            public_id = "/".join(url_path.split("/")[1:])  # strip version segment
+            public_id = public_id.rsplit(".", 1)[0]  # strip file extension
+            cloudinary.uploader.destroy(public_id)
+        except Exception:
+            pass  # Don't block upload if deletion fails
 
-    if current_user.profile_image:
-        old_file_path = Path(current_user.profile_image)
-        if old_file_path.exists():
-            old_file_path.unlink()
+    # Upload to Cloudinary
+    result = cloudinary.uploader.upload(
+        content,
+        folder="profile_pictures",
+        resource_type="image",
+        transformation=[
+            {"width": 400, "height": 400, "crop": "fill", "gravity": "face"}
+        ],
+    )
 
-    # Generate unique filename
-    unique_filename = f"{uuid.uuid4()}{file_ext}"
-    file_path = UPLOAD_DIR / unique_filename
-
-    with file_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
-    current_user.profile_image = str(file_path)
+    current_user.profile_image = result["secure_url"]
     db.commit()
     db.refresh(current_user)
 
     return {
         "message": "Profile picture uploaded successfully",
-        "profile_image": str(file_path),
+        "profile_image": result["secure_url"],
     }
 
 
@@ -330,15 +344,17 @@ def delete_profile_picture(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Delete the current user's profile picture"""
-
     if not current_user.profile_image:
         raise HTTPException(status_code=404, detail="No profile picture to delete")
 
-    # Delete file from filesystem
-    file_path = Path(current_user.profile_image)
-    if file_path.exists():
-        file_path.unlink()
+    if "cloudinary.com" in current_user.profile_image:
+        try:
+            url_path = current_user.profile_image.split("/upload/")[-1]
+            public_id = "/".join(url_path.split("/")[1:])
+            public_id = public_id.rsplit(".", 1)[0]
+            cloudinary.uploader.destroy(public_id)
+        except Exception:
+            pass
 
     current_user.profile_image = None
     db.commit()
