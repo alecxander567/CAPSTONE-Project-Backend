@@ -430,6 +430,7 @@ def start_recognition(user_id: int, db: Session = Depends(get_db)):
     ):
         raise HTTPException(status_code=503, detail="ESP32 device offline")
 
+    # Clear any previous recognition state
     state.mode = "recognize"
     state.recognition_target_id = user.finger_id
     state.recognition_finger_id = None
@@ -460,6 +461,10 @@ def recognition_result(
     if not state:
         return PlainTextResponse("error")
 
+    # Prevent processing if already have a result
+    if state.recognition_matched is not None:
+        return PlainTextResponse("already_processed")
+
     target = state.recognition_target_id
 
     # matched=true means the sensor found a fingerprint; check if it's the right one
@@ -467,7 +472,7 @@ def recognition_result(
 
     state.mode = "idle"
     state.recognition_matched = actual_match
-    state.recognition_finger_id = target  # store target so frontend poll can find it
+    state.recognition_finger_id = target
     state.recognition_target_id = None
 
     try:
@@ -485,8 +490,19 @@ def get_recognition_result(finger_id: int, db: Session = Depends(get_db)):
     state = get_device_state(db)
     if not state:
         return {"status": "pending"}
+
+    # Check if this is the result we're waiting for
     if state.recognition_finger_id == finger_id:
-        return {"status": "done", "matched": state.recognition_matched}
+        # Get the result
+        matched = state.recognition_matched
+
+        # Clear the state immediately after reading
+        state.recognition_finger_id = None
+        state.recognition_matched = None
+        db.commit()
+
+        return {"status": "done", "matched": matched}
+
     return {"status": "pending"}
 
 
