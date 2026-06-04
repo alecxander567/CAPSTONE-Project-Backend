@@ -43,7 +43,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ara-system-app.vercel.app"],
+    allow_origins=[
+        "https://ara-system-app.vercel.app",
+        "https://ara-system-51e92eids-alecxander567s-projects.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
