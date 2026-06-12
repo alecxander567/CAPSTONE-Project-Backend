@@ -79,3 +79,5 @@ alembic.ini
 alembic/
 
 firebase-adminsdk.json
+
+backup.dump
