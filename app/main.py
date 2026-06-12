@@ -75,7 +75,7 @@ app.include_router(health)
 
 
 # Health check endpoint
-@app.api_route("/ping", methods=["GET", "POST"], tags=["Health"])
+@app.api_route("/ping", methods=["GET", "POST", "HEAD"], tags=["Health"])
 async def ping(request: Request):
     return {
         "status": "ok",
