@@ -13,6 +13,7 @@ if not DATABASE_URL:
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
+    connect_args={"options": "-c search_path=public"},
 )
 
 
@@ -20,6 +21,7 @@ engine = create_engine(
 def set_isolation_level(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+    cursor.execute("SET search_path TO public")
     cursor.close()
 
 
