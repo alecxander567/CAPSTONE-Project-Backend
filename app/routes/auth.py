@@ -175,19 +175,39 @@ def logout(
 # ------------------- FORGOT PASSWORD -------------------
 @router.post("/forgot-password")
 def forgot_password(data: ForgotPasswordSchema, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.mobile_phone == data.mobile_phone).first()
+    # Normalize the phone number (remove spaces, dashes, special chars)
+    normalized_phone = data.mobile_phone.strip().replace(" ", "").replace("-", "")
+
+    # Try multiple formats if needed
+    user = db.query(User).filter(User.mobile_phone == normalized_phone).first()
+
+    # If not found, try with original format
+    if not user:
+        user = (
+            db.query(User)
+            .filter(User.mobile_phone == data.mobile_phone.strip())
+            .first()
+        )
 
     if not user:
+        # For debugging - check if user exists with any phone format
+        all_users = db.query(User).all()
+        print(f"Looking for phone: {normalized_phone}")
+        print(f"Available phones: {[u.mobile_phone for u in all_users]}")
         raise HTTPException(status_code=404, detail="Phone number not found")
 
     token = secrets.token_urlsafe(32)
     expires = datetime.utcnow() + timedelta(minutes=15)
 
-    reset = PasswordReset(user_id=user.id, token=token, expires_at=expires)
+    # Delete any existing reset tokens for this user
+    db.query(PasswordReset).filter(PasswordReset.user_id == user.id).delete()
 
+    reset = PasswordReset(user_id=user.id, token=token, expires_at=expires)
     db.add(reset)
     db.commit()
 
+    # For development, return the token in response
+    # In production, you'd send this via SMS/email
     return {"message": "Reset link sent", "token": token}
 
 
@@ -239,20 +259,25 @@ def update_user_profile(
     if not current_user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if (
-        profile_data.mobile_phone
-        and profile_data.mobile_phone != current_user.mobile_phone
-    ):
+    # Mobile phone update - FIX THIS SECTION
+    if profile_data.mobile_phone is not None:
+        # Clean the phone number (remove spaces, dashes, etc.)
+        cleaned_phone = (
+            profile_data.mobile_phone.strip().replace(" ", "").replace("-", "")
+        )
+
+        # Check if phone exists for other users
         existing_mobile = (
             db.query(User)
-            .filter(
-                User.mobile_phone == profile_data.mobile_phone,
-                User.id != current_user.id,
-            )
+            .filter(User.mobile_phone == cleaned_phone, User.id != current_user.id)
             .first()
         )
+
         if existing_mobile:
             raise HTTPException(status_code=400, detail="Mobile phone already in use")
+
+        # ACTUALLY UPDATE the mobile phone
+        current_user.mobile_phone = cleaned_phone
 
     year_level_map = {"1": "FIRST", "2": "SECOND", "3": "THIRD", "4": "FOURTH"}
 
@@ -263,8 +288,6 @@ def update_user_profile(
         current_user.last_name = profile_data.last_name
     if profile_data.middle_initial is not None:
         current_user.middle_initial = profile_data.middle_initial
-    if profile_data.mobile_phone is not None:
-        current_user.mobile_phone = profile_data.mobile_phone
 
     if profile_data.program is not None:
         program = db.query(Program).filter(Program.code == profile_data.program).first()
