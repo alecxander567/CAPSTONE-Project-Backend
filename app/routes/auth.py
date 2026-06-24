@@ -248,39 +248,6 @@ def get_user_profile(
 
 
 # ------------------- UPDATE USER PROFILE -------------------
-@router.put("/profile", response_model=UserResponse)
-def update_user_profile(
-    profile_data: UserProfileUpdate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    from app.models.programs import Program
-
-    if not current_user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # Mobile phone update - FIX THIS SECTION
-    if profile_data.mobile_phone is not None:
-        # Clean the phone number (remove spaces, dashes, etc.)
-        cleaned_phone = (
-            profile_data.mobile_phone.strip().replace(" ", "").replace("-", "")
-        )
-
-        # Check if phone exists for other users
-        existing_mobile = (
-            db.query(User)
-            .filter(User.mobile_phone == cleaned_phone, User.id != current_user.id)
-            .first()
-        )
-
-        if existing_mobile:
-            raise HTTPException(status_code=400, detail="Mobile phone already in use")
-
-        # ACTUALLY UPDATE the mobile phone
-        current_user.mobile_phone = cleaned_phone
-
-
-# ------------------- UPDATE USER PROFILE -------------------
 
 YEAR_LEVEL_MAP = {
     "1": "1st year",
@@ -305,14 +272,12 @@ def update_user_profile(
     if not current_user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Mobile phone update - FIX THIS SECTION
+    # Mobile phone update
     if profile_data.mobile_phone is not None:
-        # Clean the phone number (remove spaces, dashes, etc.)
         cleaned_phone = (
             profile_data.mobile_phone.strip().replace(" ", "").replace("-", "")
         )
 
-        # Check if phone exists for other users
         existing_mobile = (
             db.query(User)
             .filter(User.mobile_phone == cleaned_phone, User.id != current_user.id)
@@ -322,7 +287,6 @@ def update_user_profile(
         if existing_mobile:
             raise HTTPException(status_code=400, detail="Mobile phone already in use")
 
-        # ACTUALLY UPDATE the mobile phone
         current_user.mobile_phone = cleaned_phone
 
     # Update only the fields that are provided
@@ -385,14 +349,12 @@ async def upload_profile_picture(
     # Delete old Cloudinary image if it exists
     if current_user.profile_image and "cloudinary.com" in current_user.profile_image:
         try:
-            # Extract public_id from URL
-            # URL format: https://res.cloudinary.com/<cloud>/image/upload/v123/<public_id>.ext
             url_path = current_user.profile_image.split("/upload/")[-1]
-            public_id = "/".join(url_path.split("/")[1:])  # strip version segment
-            public_id = public_id.rsplit(".", 1)[0]  # strip file extension
+            public_id = "/".join(url_path.split("/")[1:])
+            public_id = public_id.rsplit(".", 1)[0]
             cloudinary.uploader.destroy(public_id)
         except Exception:
-            pass  # Don't block upload if deletion fails
+            pass
 
     # Upload to Cloudinary
     result = cloudinary.uploader.upload(
