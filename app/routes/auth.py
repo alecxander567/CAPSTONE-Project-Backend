@@ -279,7 +279,51 @@ def update_user_profile(
         # ACTUALLY UPDATE the mobile phone
         current_user.mobile_phone = cleaned_phone
 
-    year_level_map = {"1": "FIRST", "2": "SECOND", "3": "THIRD", "4": "FOURTH"}
+
+# ------------------- UPDATE USER PROFILE -------------------
+
+YEAR_LEVEL_MAP = {
+    "1": "1st year",
+    "2": "2nd year",
+    "3": "3rd year",
+    "4": "4th year",
+    "1ST YEAR": "1st year",
+    "2ND YEAR": "2nd year",
+    "3RD YEAR": "3rd year",
+    "4TH YEAR": "4th year",
+}
+
+
+@router.put("/profile", response_model=UserResponse)
+def update_user_profile(
+    profile_data: UserProfileUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    from app.models.programs import Program
+
+    if not current_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Mobile phone update - FIX THIS SECTION
+    if profile_data.mobile_phone is not None:
+        # Clean the phone number (remove spaces, dashes, etc.)
+        cleaned_phone = (
+            profile_data.mobile_phone.strip().replace(" ", "").replace("-", "")
+        )
+
+        # Check if phone exists for other users
+        existing_mobile = (
+            db.query(User)
+            .filter(User.mobile_phone == cleaned_phone, User.id != current_user.id)
+            .first()
+        )
+
+        if existing_mobile:
+            raise HTTPException(status_code=400, detail="Mobile phone already in use")
+
+        # ACTUALLY UPDATE the mobile phone
+        current_user.mobile_phone = cleaned_phone
 
     # Update only the fields that are provided
     if profile_data.first_name is not None:
@@ -299,8 +343,17 @@ def update_user_profile(
 
     if profile_data.profile_image is not None:
         current_user.profile_image = profile_data.profile_image
+
+    # YEAR LEVEL - only touch it if a value was actually sent, and never
+    # silently null it out on an unrecognized value
     if profile_data.year_level is not None:
-        current_user.year_level = year_level_map.get(profile_data.year_level)
+        normalized_year_level = YEAR_LEVEL_MAP.get(profile_data.year_level.upper())
+        if normalized_year_level is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid year level: '{profile_data.year_level}'",
+            )
+        current_user.year_level = normalized_year_level
 
     db.commit()
     db.refresh(current_user)
