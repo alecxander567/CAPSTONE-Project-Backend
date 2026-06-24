@@ -50,6 +50,7 @@ class UserLogin(BaseModel):
 
 
 class UserProfileUpdate(BaseModel):
+    student_id_no: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     middle_initial: Optional[str] = None
