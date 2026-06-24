@@ -272,23 +272,19 @@ def update_user_profile(
     if not current_user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Check if user is admin
     is_admin = current_user.role == UserRole.ADMIN
 
-    # If admin is trying to update program or year_level, block it explicitly
-    if is_admin:
-        if profile_data.program is not None:
-            raise HTTPException(
-                status_code=403, detail="Admin users cannot update program information"
-            )
-        if profile_data.year_level is not None:
-            raise HTTPException(
-                status_code=403, detail="Admin users cannot update year level"
-            )
+    # HARD BLOCK: admins can never set program or year_level, no matter what
+    if is_admin and (
+        profile_data.program is not None or profile_data.year_level is not None
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Admin users cannot update program or year level",
+        )
 
-    # Update student_id_no if provided (allowed for all users)
+    # student_id_no — allowed for everyone (admin + student)
     if profile_data.student_id_no is not None:
-        # Check if the new student_id_no is already taken by another user
         existing_student = (
             db.query(User)
             .filter(
@@ -301,24 +297,21 @@ def update_user_profile(
             raise HTTPException(status_code=400, detail="Student ID already registered")
         current_user.student_id_no = profile_data.student_id_no
 
-    # Mobile phone update
+    # mobile phone — allowed for everyone
     if profile_data.mobile_phone is not None:
         cleaned_phone = (
             profile_data.mobile_phone.strip().replace(" ", "").replace("-", "")
         )
-
         existing_mobile = (
             db.query(User)
             .filter(User.mobile_phone == cleaned_phone, User.id != current_user.id)
             .first()
         )
-
         if existing_mobile:
             raise HTTPException(status_code=400, detail="Mobile phone already in use")
-
         current_user.mobile_phone = cleaned_phone
 
-    # Update name fields (allowed for all users)
+    # names — allowed for everyone
     if profile_data.first_name is not None:
         current_user.first_name = profile_data.first_name
     if profile_data.last_name is not None:
@@ -326,7 +319,7 @@ def update_user_profile(
     if profile_data.middle_initial is not None:
         current_user.middle_initial = profile_data.middle_initial
 
-    # Only update program and year_level for NON-ADMIN users
+    # program / year_level — STUDENTS ONLY (already guaranteed not-admin past the block above)
     if not is_admin:
         if profile_data.program is not None:
             program = (
