@@ -272,6 +272,35 @@ def update_user_profile(
     if not current_user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Check if user is admin
+    is_admin = current_user.role == UserRole.ADMIN
+
+    # If admin is trying to update program or year_level, block it explicitly
+    if is_admin:
+        if profile_data.program is not None:
+            raise HTTPException(
+                status_code=403, detail="Admin users cannot update program information"
+            )
+        if profile_data.year_level is not None:
+            raise HTTPException(
+                status_code=403, detail="Admin users cannot update year level"
+            )
+
+    # Update student_id_no if provided (allowed for all users)
+    if profile_data.student_id_no is not None:
+        # Check if the new student_id_no is already taken by another user
+        existing_student = (
+            db.query(User)
+            .filter(
+                User.student_id_no == profile_data.student_id_no,
+                User.id != current_user.id,
+            )
+            .first()
+        )
+        if existing_student:
+            raise HTTPException(status_code=400, detail="Student ID already registered")
+        current_user.student_id_no = profile_data.student_id_no
+
     # Mobile phone update
     if profile_data.mobile_phone is not None:
         cleaned_phone = (
@@ -289,7 +318,7 @@ def update_user_profile(
 
         current_user.mobile_phone = cleaned_phone
 
-    # Update only the fields that are provided
+    # Update name fields (allowed for all users)
     if profile_data.first_name is not None:
         current_user.first_name = profile_data.first_name
     if profile_data.last_name is not None:
@@ -297,27 +326,30 @@ def update_user_profile(
     if profile_data.middle_initial is not None:
         current_user.middle_initial = profile_data.middle_initial
 
-    if profile_data.program is not None:
-        program = db.query(Program).filter(Program.code == profile_data.program).first()
-        if not program:
-            raise HTTPException(
-                status_code=400, detail=f"Program '{profile_data.program}' not found"
+    # Only update program and year_level for NON-ADMIN users
+    if not is_admin:
+        if profile_data.program is not None:
+            program = (
+                db.query(Program).filter(Program.code == profile_data.program).first()
             )
-        current_user.program_id = program.id
+            if not program:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Program '{profile_data.program}' not found",
+                )
+            current_user.program_id = program.id
+
+        if profile_data.year_level is not None:
+            normalized_year_level = YEAR_LEVEL_MAP.get(profile_data.year_level.upper())
+            if normalized_year_level is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid year level: '{profile_data.year_level}'",
+                )
+            current_user.year_level = normalized_year_level
 
     if profile_data.profile_image is not None:
         current_user.profile_image = profile_data.profile_image
-
-    # YEAR LEVEL - only touch it if a value was actually sent, and never
-    # silently null it out on an unrecognized value
-    if profile_data.year_level is not None:
-        normalized_year_level = YEAR_LEVEL_MAP.get(profile_data.year_level.upper())
-        if normalized_year_level is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid year level: '{profile_data.year_level}'",
-            )
-        current_user.year_level = normalized_year_level
 
     db.commit()
     db.refresh(current_user)
