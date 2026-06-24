@@ -7,7 +7,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Load environment variables from .env
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -15,11 +14,9 @@ if not DATABASE_URL:
     raise ValueError("DATABASE_URL is not set in environment variables")
 
 
-# Add SSL parameters for PostgreSQL if not already present
 def get_db_url_with_ssl(url: str) -> str:
     """Ensure SSL parameters are added for PostgreSQL connections"""
     if "postgresql" in url.lower():
-        # Check if ssl_mode is already in the URL
         if "?" not in url:
             url += "?ssl_mode=require"
         elif "ssl_mode" not in url and "sslmode" not in url:
@@ -29,11 +26,12 @@ def get_db_url_with_ssl(url: str) -> str:
 
 DATABASE_URL = get_db_url_with_ssl(DATABASE_URL)
 
-# Enhanced engine configuration
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_recycle=300,
+    pool_recycle=120,  # lowered from 300s — recycle connections more
+    # aggressively so they don't go stale against
+    # provider-side idle timeouts shorter than 5 min
     pool_size=5,
     max_overflow=10,
     pool_timeout=30,
@@ -52,7 +50,6 @@ engine = create_engine(
 )
 
 
-# SQLAlchemy 2.0 style event listener
 @event.listens_for(engine, "connect")
 def set_isolation_level(dbapi_connection, connection_record):
     """Set isolation level and search path for new connections"""
@@ -63,17 +60,14 @@ def set_isolation_level(dbapi_connection, connection_record):
         cursor.close()
     except Exception as e:
         logger.warning(f"Error setting isolation level: {e}")
-        # Don't raise, let the connection continue
 
 
-# Add listener for connection checkouts
 @event.listens_for(engine, "checkout")
 def on_checkout(dbapi_connection, connection_record, connection_proxy):
     """Log when a connection is checked out (for debugging)"""
     logger.debug(f"Connection checked out: {dbapi_connection}")
 
 
-# Add listener for connection invalidation
 @event.listens_for(engine, "invalidate")
 def on_invalidate(dbapi_connection, connection_record, exception):
     """Log when a connection is invalidated"""
@@ -106,7 +100,6 @@ def get_db():
             logger.warning(f"Error closing database session: {e}")
 
 
-# ✅ Optional: Context manager for manual session handling
 from contextlib import contextmanager
 
 
