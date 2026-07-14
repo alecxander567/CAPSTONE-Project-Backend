@@ -44,6 +44,40 @@ def get_device_state(db: Session) -> DeviceState:
     return state
 
 
+# ------------------- MODE LOCK HELPER -------------------
+MODE_LABELS = {
+    "enroll": "Enrollment",
+    "delete": "Fingerprint deletion",
+    "attendance": "Attendance",
+    "recognize": "Recognition test",
+}
+
+DEVICE_STALE_SECONDS = 15  # a bit above HEARTBEAT_MS (10s) with margin
+
+
+def ensure_device_free(state: DeviceState, requested_mode: str):
+    """
+    Raise 409 if the device is busy running a different mode.
+    If the device hasn't heartbeated recently, treat it as stuck/offline
+    and allow the new mode to take over (self-heal instead of permanent lock).
+    """
+    if state.mode == "idle" or state.mode == requested_mode:
+        return
+
+    device_stale = (
+        not state.last_seen
+        or datetime.utcnow() - state.last_seen > timedelta(seconds=DEVICE_STALE_SECONDS)
+    )
+    if device_stale:
+        return  # stale/offline device — allow new mode to override
+
+    current_label = MODE_LABELS.get(state.mode, state.mode)
+    raise HTTPException(
+        status_code=409,
+        detail=f"{current_label} mode is currently ongoing. Please wait until it finishes.",
+    )
+
+
 # ------------------- START ENROLLMENT -------------------
 @router.post("/start-enrollment")
 def start_enrollment(
@@ -57,6 +91,9 @@ def start_enrollment(
     user = db.query(User).filter(User.id == request.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    state = get_device_state(db)
+    ensure_device_free(state, "enroll")
 
     # Reset previous enrollment state
     if user.status != FingerprintStatus.NOT_ENROLLED:
@@ -79,7 +116,6 @@ def start_enrollment(
     user.enroll_status = EnrollmentStep.PENDING
     user.status = FingerprintStatus.PENDING
 
-    state = get_device_state(db)
     state.mode = "enroll"
 
     try:
@@ -277,6 +313,8 @@ def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_d
             detail="ESP32 device is offline. Cannot unenroll fingerprint.",
         )
 
+    ensure_device_free(state, "delete")
+
     state.pending_delete_id = user.finger_id
     state.mode = "delete"
 
@@ -320,6 +358,8 @@ def device_status(db: Session = Depends(get_db)):
 @router.post("/start-attendance")
 def start_attendance(db: Session = Depends(get_db)):
     state = get_device_state(db)
+    ensure_device_free(state, "attendance")
+
     state.mode = "attendance"
     try:
         db.commit()
@@ -429,6 +469,8 @@ def start_recognition(user_id: int, db: Session = Depends(get_db)):
         seconds=10
     ):
         raise HTTPException(status_code=503, detail="ESP32 device offline")
+
+    ensure_device_free(state, "recognize")
 
     # Clear any previous recognition state
     state.mode = "recognize"
