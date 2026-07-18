@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from app.core.database import get_db
 from app.models.user import User, FingerprintStatus, EnrollmentStep
 from fastapi.responses import PlainTextResponse
@@ -372,20 +373,19 @@ def mark_attendance(
         if user.program_id != ongoing_event.program_id:
             return PlainTextResponse("wrong_program")
 
-    # NOTE: this check-then-insert is not atomic. Under simultaneous scans of the
-    # SAME student on two devices within the same request window, both could pass
-    # this check before either commits. If that becomes an issue in practice, add
-    # a unique constraint on (user_id, event_id) in the Attendance table so the
-    # second insert fails cleanly instead of creating a duplicate row.
-    existing = (
-        db.query(Attendance)
-        .filter(Attendance.user_id == user.id)
-        .filter(Attendance.event_id == ongoing_event.id)
-        .first()
-    )
-    if existing:
-        return PlainTextResponse("already_marked")
-
+    # ── Atomic INSERT with database-level unique constraint ────────────────
+    # The Attendance model now has a UNIQUE constraint on (user_id, event_id).
+    # Instead of the racy check-then-insert pattern, we attempt the INSERT
+    # directly. If a row for this (user, event) already exists, PostgreSQL
+    # will raise an IntegrityError, which we catch and return "already_marked".
+    #
+    # This is fully atomic — even when two ESP32s send mark-attendance for
+    # the same student at the exact same time, only one INSERT succeeds and
+    # the other cleanly fails on the constraint.
+    #
+    # For DIFFERENT students scanning simultaneously on two devices, each
+    # INSERT targets a different (user_id, event_id) pair, so they never
+    # conflict — both succeed independently.
     new_attendance = Attendance(
         user_id=user.id,
         event_id=ongoing_event.id,
@@ -397,11 +397,28 @@ def mark_attendance(
     try:
         db.commit()
         db.refresh(new_attendance)
+        log_request(
+            "MARK-ATTENDANCE",
+            client_ip,
+            f"| device={device_id} | finger_id={finger_id} | SUCCESS attendance recorded",
+        )
+        return PlainTextResponse("attendance_marked")
+    except IntegrityError:
+        db.rollback()
+        log_request(
+            "MARK-ATTENDANCE",
+            client_ip,
+            f"| device={device_id} | finger_id={finger_id} | ALREADY MARKED (unique constraint)",
+        )
+        return PlainTextResponse("already_marked")
     except Exception as e:
         db.rollback()
+        log_request(
+            "MARK-ATTENDANCE",
+            client_ip,
+            f"| device={device_id} | finger_id={finger_id} | DATABASE ERROR: {e}",
+        )
         return PlainTextResponse("database_error")
-
-    return PlainTextResponse("attendance_marked")
 
 
 # ------------------- DEVICE MODE FOR ESP32 -------------------

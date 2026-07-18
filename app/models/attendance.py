@@ -1,5 +1,5 @@
 import enum
-from sqlalchemy import Column, Integer, DateTime, Enum, ForeignKey
+from sqlalchemy import Column, Integer, DateTime, Enum, ForeignKey, UniqueConstraint
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -31,3 +31,12 @@ class Attendance(Base):
 
     user = relationship("User", back_populates="attendances")
     event = relationship("Event")
+
+    # ── Database-level unique constraint ──────────────────────────────────
+    # Prevents duplicate attendance records even under concurrent requests.
+    # When two ESP32s send mark-attendance for the same (user, event) at
+    # nearly the same time, the first INSERT succeeds and the second hits
+    # this constraint and fails cleanly — no silent duplicates.
+    __table_args__ = (
+        UniqueConstraint("user_id", "event_id", name="uq_attendance_user_event"),
+    )
