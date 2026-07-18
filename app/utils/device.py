@@ -56,6 +56,18 @@ def set_mode_on_all_devices(db: Session, mode: str) -> None:
     db.commit()
 
 
+def set_active_event_on_all_devices(db: Session, event_id: int | None) -> None:
+    """
+    Attendance mode is exclusive and system-wide (see set_mode_on_all_devices),
+    so every device shares the same active event — whichever event the
+    dashboard's Start Attendance button was pressed for.
+    """
+    devices = get_all_device_states(db)
+    for d in devices:
+        d.active_event_id = event_id
+    db.commit()
+
+
 MODE_LABELS = {
     "enroll": "Enrollment",
     "delete": "Fingerprint deletion",

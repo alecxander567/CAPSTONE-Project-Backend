@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
 from app.core.database import Base
 
 
@@ -13,3 +13,4 @@ class DeviceState(Base):
     recognition_matched = Column(Boolean, nullable=True)
     recognition_target_id = Column(Integer, nullable=True)
     last_seen = Column(DateTime, nullable=True)
+    active_event_id = Column(Integer, ForeignKey("events.id"), nullable=True)  

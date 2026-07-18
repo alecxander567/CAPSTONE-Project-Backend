@@ -5,13 +5,14 @@ from app.models.user import User, FingerprintStatus, EnrollmentStep
 from fastapi.responses import PlainTextResponse
 import random
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime
 from app.models.attendance import Attendance, AttendanceStatus
 from app.models.events import Event
 from app.utils.device import (
     get_device_state,
     get_all_device_states,
     set_mode_on_all_devices,
+    set_active_event_on_all_devices,
     ensure_all_devices_free,
     is_device_online,
     DEFAULT_DEVICE_ID,
@@ -25,6 +26,10 @@ ph_tz = pytz.timezone("Asia/Manila")
 
 class EnrollmentRequest(BaseModel):
     user_id: int
+
+
+class StartAttendanceRequest(BaseModel):
+    event_id: int
 
 
 def log_request(endpoint: str, client_ip: str, extra: str = ""):
@@ -309,15 +314,24 @@ def device_status(db: Session = Depends(get_db)):
 
 # ------------------- START/STOP ATTENDANCE -------------------
 @router.post("/start-attendance")
-def start_attendance(db: Session = Depends(get_db)):
+def start_attendance(
+    request: StartAttendanceRequest,
+    db: Session = Depends(get_db),
+):
+    event = db.query(Event).filter(Event.id == request.event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
     ensure_all_devices_free(db, "attendance")
     set_mode_on_all_devices(db, "attendance")
-    return {"message": "Attendance mode started"}
+    set_active_event_on_all_devices(db, request.event_id)
+    return {"message": "Attendance mode started", "event_id": request.event_id}
 
 
 @router.post("/stop-attendance")
 def stop_attendance(db: Session = Depends(get_db)):
     set_mode_on_all_devices(db, "idle")
+    set_active_event_on_all_devices(db, None)
     return {"message": "Attendance mode stopped"}
 
 
@@ -340,15 +354,11 @@ def mark_attendance(
     if user.status != FingerprintStatus.ENROLLED:
         return PlainTextResponse("not_enrolled")
 
-    ph_now = datetime.now(ph_tz)
-    today = ph_now.date()
+    state = get_device_state(db, device_id)
+    if not state.active_event_id:
+        return PlainTextResponse("no_active_event")
 
-    events = db.query(Event).filter(Event.event_date == today).all()
-
-    ongoing_event = None
-    if events:
-        ongoing_event = events[0]
-
+    ongoing_event = db.query(Event).filter(Event.id == state.active_event_id).first()
     if not ongoing_event:
         return PlainTextResponse("no_active_event")
 
@@ -526,6 +536,7 @@ def debug_device_state(db: Session = Depends(get_db)):
                 "device_id": s.device_id,
                 "mode": s.mode,
                 "pending_delete_id": s.pending_delete_id,
+                "active_event_id": s.active_event_id,
                 "last_seen": s.last_seen,
                 "online": is_device_online(s),
             }
