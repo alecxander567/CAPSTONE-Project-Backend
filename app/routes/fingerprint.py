@@ -8,7 +8,14 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from app.models.attendance import Attendance, AttendanceStatus
 from app.models.events import Event
-from app.models.device import DeviceState
+from app.utils.device import (
+    get_device_state,
+    get_all_device_states,
+    set_mode_on_all_devices,
+    ensure_all_devices_free,
+    is_device_online,
+    DEFAULT_DEVICE_ID,
+)
 import pytz
 
 router = APIRouter(prefix="/fingerprints", tags=["Fingerprints"])
@@ -25,59 +32,6 @@ def log_request(endpoint: str, client_ip: str, extra: str = ""):
     print(f"[{timestamp}] {endpoint} | {client_ip} {extra}")
 
 
-def get_device_state(db: Session) -> DeviceState:
-    """Get or create device state."""
-    state = db.query(DeviceState).filter(DeviceState.id == 1).first()
-    if not state:
-        state = DeviceState(
-            id=1,
-            mode="idle",
-            pending_delete_id=None,
-            recognition_target_id=None,
-            recognition_finger_id=None,
-            recognition_matched=None,
-            last_seen=None,
-        )
-        db.add(state)
-        db.commit()
-        db.refresh(state)
-    return state
-
-
-# ------------------- MODE LOCK HELPER -------------------
-MODE_LABELS = {
-    "enroll": "Enrollment",
-    "delete": "Fingerprint deletion",
-    "attendance": "Attendance",
-    "recognize": "Recognition test",
-}
-
-DEVICE_STALE_SECONDS = 15  # a bit above HEARTBEAT_MS (10s) with margin
-
-
-def ensure_device_free(state: DeviceState, requested_mode: str):
-    """
-    Raise 409 if the device is busy running a different mode.
-    If the device hasn't heartbeated recently, treat it as stuck/offline
-    and allow the new mode to take over (self-heal instead of permanent lock).
-    """
-    if state.mode == "idle" or state.mode == requested_mode:
-        return
-
-    device_stale = (
-        not state.last_seen
-        or datetime.utcnow() - state.last_seen > timedelta(seconds=DEVICE_STALE_SECONDS)
-    )
-    if device_stale:
-        return  # stale/offline device — allow new mode to override
-
-    current_label = MODE_LABELS.get(state.mode, state.mode)
-    raise HTTPException(
-        status_code=409,
-        detail=f"{current_label} mode is currently ongoing. Please wait until it finishes.",
-    )
-
-
 # ------------------- START ENROLLMENT -------------------
 @router.post("/start-enrollment")
 def start_enrollment(
@@ -92,8 +46,7 @@ def start_enrollment(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    state = get_device_state(db)
-    ensure_device_free(state, "enroll")
+    ensure_all_devices_free(db, "enroll")
 
     # Reset previous enrollment state
     if user.status != FingerprintStatus.NOT_ENROLLED:
@@ -116,15 +69,14 @@ def start_enrollment(
     user.enroll_status = EnrollmentStep.PENDING
     user.status = FingerprintStatus.PENDING
 
-    state.mode = "enroll"
-
     try:
         db.commit()
         db.refresh(user)
-        db.refresh(state)
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+    set_mode_on_all_devices(db, "enroll")
 
     return {
         "message": "Enrollment started",
@@ -223,15 +175,14 @@ def update_enrollment(
         user.enroll_status = enroll_step
         user.status = fingerprint_status
 
-    if status in ["success", "error", "delete_success", "delete_error"]:
-        state = get_device_state(db)
-        state.mode = "idle"
-
     try:
         db.commit()
     except Exception as e:
         db.rollback()
         return PlainTextResponse("error")
+
+    if status in ["success", "error", "delete_success", "delete_error"]:
+        set_mode_on_all_devices(db, "idle")
 
     return PlainTextResponse("updated")
 
@@ -302,25 +253,22 @@ def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_d
     if not user.finger_id:
         raise HTTPException(status_code=400, detail="User has no finger_id")
 
-    state = get_device_state(db)
-
-    # Device online check
-    if not state.last_seen or datetime.utcnow() - state.last_seen > timedelta(
-        seconds=10
-    ):
+    # At least one device must be online to accept a delete request
+    if not any(is_device_online(s) for s in get_all_device_states(db)):
         raise HTTPException(
             status_code=400,
-            detail="ESP32 device is offline. Cannot unenroll fingerprint.",
+            detail="No ESP32 device is online. Cannot unenroll fingerprint.",
         )
 
-    ensure_device_free(state, "delete")
+    ensure_all_devices_free(db, "delete")
 
-    state.pending_delete_id = user.finger_id
-    state.mode = "delete"
+    devices = get_all_device_states(db)
+    for d in devices:
+        d.pending_delete_id = user.finger_id
+        d.mode = "delete"
 
     try:
         db.commit()
-        db.refresh(state)
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
@@ -330,13 +278,21 @@ def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_d
 
 # ------------------- DEVICE CHECK DELETE -------------------
 @router.get("/check-delete")
-def check_delete(req: Request, db: Session = Depends(get_db)):
+def check_delete(
+    req: Request,
+    device_id: str = DEFAULT_DEVICE_ID,
+    db: Session = Depends(get_db),
+):
     client_ip = req.client.host
-    state = get_device_state(db)
+    state = get_device_state(db, device_id)
 
     if state.pending_delete_id is not None:
         finger_id = state.pending_delete_id
-        log_request("CHECK-DELETE", client_ip, f"| Found finger_id={finger_id}")
+        log_request(
+            "CHECK-DELETE",
+            client_ip,
+            f"| device={device_id} | Found finger_id={finger_id}",
+        )
         state.pending_delete_id = None
         db.commit()
         return PlainTextResponse(str(finger_id))
@@ -344,40 +300,24 @@ def check_delete(req: Request, db: Session = Depends(get_db)):
     return PlainTextResponse("none")
 
 
-# ------------------- DEVICE STATUS -------------------
+# ------------------- DEVICE STATUS (any device online) -------------------
 @router.get("/device-status")
 def device_status(db: Session = Depends(get_db)):
-    state = get_device_state(db)
-    connected = False
-    if state.last_seen and datetime.utcnow() - state.last_seen < timedelta(seconds=10):
-        connected = True
+    connected = any(is_device_online(s) for s in get_all_device_states(db))
     return {"connected": connected}
 
 
 # ------------------- START/STOP ATTENDANCE -------------------
 @router.post("/start-attendance")
 def start_attendance(db: Session = Depends(get_db)):
-    state = get_device_state(db)
-    ensure_device_free(state, "attendance")
-
-    state.mode = "attendance"
-    try:
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+    ensure_all_devices_free(db, "attendance")
+    set_mode_on_all_devices(db, "attendance")
     return {"message": "Attendance mode started"}
 
 
 @router.post("/stop-attendance")
 def stop_attendance(db: Session = Depends(get_db)):
-    state = get_device_state(db)
-    state.mode = "idle"
-    try:
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+    set_mode_on_all_devices(db, "idle")
     return {"message": "Attendance mode stopped"}
 
 
@@ -386,10 +326,13 @@ def stop_attendance(db: Session = Depends(get_db)):
 def mark_attendance(
     req: Request,
     finger_id: int,
+    device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
 ):
     client_ip = req.client.host
-    log_request("MARK-ATTENDANCE", client_ip, f"| finger_id={finger_id}")
+    log_request(
+        "MARK-ATTENDANCE", client_ip, f"| device={device_id} | finger_id={finger_id}"
+    )
 
     user = db.query(User).filter(User.finger_id == finger_id).first()
     if not user:
@@ -412,13 +355,18 @@ def mark_attendance(
     log_request(
         "MARK-ATTENDANCE",
         client_ip,
-        f"| finger_id={finger_id} | saving to event_id={ongoing_event.id}",
+        f"| device={device_id} | finger_id={finger_id} | saving to event_id={ongoing_event.id}",
     )
 
     if ongoing_event.program_id is not None:
         if user.program_id != ongoing_event.program_id:
             return PlainTextResponse("wrong_program")
 
+    # NOTE: this check-then-insert is not atomic. Under simultaneous scans of the
+    # SAME student on two devices within the same request window, both could pass
+    # this check before either commits. If that becomes an issue in practice, add
+    # a unique constraint on (user_id, event_id) in the Attendance table so the
+    # second insert fails cleanly instead of creating a duplicate row.
     existing = (
         db.query(Attendance)
         .filter(Attendance.user_id == user.id)
@@ -448,8 +396,11 @@ def mark_attendance(
 
 # ------------------- DEVICE MODE FOR ESP32 -------------------
 @router.get("/device-mode")
-def get_device_mode(db: Session = Depends(get_db)):
-    state = get_device_state(db)
+def get_device_mode(
+    device_id: str = DEFAULT_DEVICE_ID,
+    db: Session = Depends(get_db),
+):
+    state = get_device_state(db, device_id)
     return PlainTextResponse(state.mode)
 
 
@@ -462,32 +413,27 @@ def start_recognition(user_id: int, db: Session = Depends(get_db)):
     if user.status != FingerprintStatus.ENROLLED:
         raise HTTPException(status_code=400, detail="User not enrolled")
 
-    state = get_device_state(db)
+    if not any(is_device_online(s) for s in get_all_device_states(db)):
+        raise HTTPException(status_code=503, detail="No ESP32 device online")
 
-    # Check if device is online based on last_seen timestamp
-    if not state.last_seen or datetime.utcnow() - state.last_seen > timedelta(
-        seconds=10
-    ):
-        raise HTTPException(status_code=503, detail="ESP32 device offline")
+    ensure_all_devices_free(db, "recognize")
 
-    ensure_device_free(state, "recognize")
-
-    # Clear any previous recognition state
-    state.mode = "recognize"
-    state.recognition_target_id = user.finger_id
-    state.recognition_finger_id = None
-    state.recognition_matched = None
+    devices = get_all_device_states(db)
+    for d in devices:
+        d.mode = "recognize"
+        d.recognition_target_id = user.finger_id
+        d.recognition_finger_id = None
+        d.recognition_matched = None
 
     try:
         db.commit()
-        db.refresh(state)
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
     return {
         "message": "Recognition test started",
-        "target_finger_id": state.recognition_target_id,
+        "target_finger_id": user.finger_id,
     }
 
 
@@ -496,12 +442,10 @@ def start_recognition(user_id: int, db: Session = Depends(get_db)):
 def recognition_result(
     finger_id: int,
     matched: bool,
+    device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
 ):
-    state = get_device_state(db)
-
-    if not state:
-        return PlainTextResponse("error")
+    state = get_device_state(db, device_id)
 
     # Prevent processing if already have a result
     if state.recognition_matched is not None:
@@ -512,7 +456,6 @@ def recognition_result(
     # matched=true means the sensor found a fingerprint; check if it's the right one
     actual_match = matched and (finger_id == target)
 
-    state.mode = "idle"
     state.recognition_matched = actual_match
     state.recognition_finger_id = target
     state.recognition_target_id = None
@@ -523,19 +466,23 @@ def recognition_result(
         db.rollback()
         return PlainTextResponse("error")
 
+    # Recognition is exclusive across the fleet — release everyone back to idle
+    set_mode_on_all_devices(db, "idle")
+
     return PlainTextResponse("ok")
 
 
 # ------------------- FRONTEND POLLS FOR RECOGNITION RESULT -------------------
 @router.get("/get-recognition-result")
-def get_recognition_result(finger_id: int, db: Session = Depends(get_db)):
-    state = get_device_state(db)
-    if not state:
-        return {"status": "pending"}
+def get_recognition_result(
+    finger_id: int,
+    device_id: str = DEFAULT_DEVICE_ID,
+    db: Session = Depends(get_db),
+):
+    state = get_device_state(db, device_id)
 
     # Check if this is the result we're waiting for
     if state.recognition_finger_id == finger_id:
-        # Get the result
         matched = state.recognition_matched
 
         # Clear the state immediately after reading
@@ -565,19 +512,25 @@ def debug_all_enrolled(db: Session = Depends(get_db)):
     ]
 
 
-# ------------------- DEBUG DEVICE STATE -------------------
+# ------------------- DEBUG DEVICE STATE (all devices) -------------------
 @router.get("/debug/device-state")
 def debug_device_state(db: Session = Depends(get_db)):
     db.expire_all()
-    state = get_device_state(db)
+    states = get_all_device_states(db)
     pending_users = (
         db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
     )
     return {
-        "device_state": {
-            "mode": state.mode,
-            "pending_delete_id": state.pending_delete_id,
-        },
+        "devices": [
+            {
+                "device_id": s.device_id,
+                "mode": s.mode,
+                "pending_delete_id": s.pending_delete_id,
+                "last_seen": s.last_seen,
+                "online": is_device_online(s),
+            }
+            for s in states
+        ],
         "pending_enrollments": [
             {
                 "user_id": u.id,
