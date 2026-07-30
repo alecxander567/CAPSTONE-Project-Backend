@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from datetime import datetime
 from fastapi.responses import JSONResponse
 from app.core.database import get_db
@@ -67,8 +68,15 @@ def update_attendance_status(
         )
         db.add(attendance)
 
-    db.commit()
-    db.refresh(attendance)
+    try:
+        db.commit()
+        db.refresh(attendance)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Attendance already marked for this event")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
     return JSONResponse(
         {"student_id_no": user.student_id_no, "status": attendance.status.value}

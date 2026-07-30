@@ -64,6 +64,11 @@ class User(Base):
 
     finger_id = Column(Integer, unique=True, nullable=True)
 
+    # Tracks which ESP32 device claimed this user for an enrollment session.
+    # Prevents two devices from simultaneously enrolling the same user.
+    # Cleared when enrollment completes (success/error/reset).
+    claimed_by_device = Column(String(50), nullable=True)
+
     enroll_status = Column(
         Enum(
             EnrollmentStep,

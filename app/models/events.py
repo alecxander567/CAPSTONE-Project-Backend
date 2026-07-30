@@ -2,8 +2,9 @@ from sqlalchemy import Column, Integer, String, Text, Date, Time, DateTime, Fore
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.core.database import Base
-from datetime import datetime, date
+from datetime import datetime, date, time
 from enum import Enum
+import pytz
 
 
 class EventStatus(str, Enum):
@@ -36,16 +37,18 @@ class Event(Base):
 
     @property
     def status(self) -> EventStatus:
-        now = datetime.now()
-        today = date.today()
+        ph_tz = pytz.timezone("Asia/Manila")
+        now = datetime.now(ph_tz)
+        today = now.date()
+        now_time = now.time()
 
         if self.event_date < today:
             return EventStatus.DONE
 
         if self.event_date == today:
-            if self.start_time <= now.time() <= self.end_time:
+            if self.start_time <= now_time <= self.end_time:
                 return EventStatus.ONGOING
-            if now.time() > self.end_time:
+            if now_time > self.end_time:
                 return EventStatus.DONE
             return EventStatus.UPCOMING
 

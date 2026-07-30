@@ -6,7 +6,7 @@ from app.models.user import User, FingerprintStatus, EnrollmentStep
 from fastapi.responses import PlainTextResponse
 import random
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 from app.models.attendance import Attendance, AttendanceStatus
 from app.models.events import Event
 from app.models.device import DeviceState
@@ -24,6 +24,11 @@ import pytz
 router = APIRouter(prefix="/fingerprints", tags=["Fingerprints"])
 
 ph_tz = pytz.timezone("Asia/Manila")
+
+# How long a pending_delete can stay unresolved before we consider it stale
+# and allow the finger_id to be recycled. 5 minutes is generous for any
+# realistic ESP32 round-trip.
+PENDING_DELETE_TIMEOUT_SECONDS = 300
 
 
 class EnrollmentRequest(BaseModel):
@@ -46,11 +51,17 @@ def _finger_ids_in_flight(db: Session) -> set[int]:
     user's row has already been cleared — otherwise a late delete
     confirmation from a slow/offline device can land on the new owner.
     """
-    return {
-        s.pending_delete_id
-        for s in get_all_device_states(db)
-        if s.pending_delete_id is not None
-    }
+    now = datetime.utcnow()
+    stale_cutoff = now - timedelta(seconds=PENDING_DELETE_TIMEOUT_SECONDS)
+    in_flight = set()
+    for s in get_all_device_states(db):
+        if s.pending_delete_id is not None:
+            # If the pending_delete has been sitting unresolved for too long,
+            # treat it as stale and allow the finger_id to be recycled.
+            if s.pending_delete_updated_at and s.pending_delete_updated_at < stale_cutoff:
+                continue
+            in_flight.add(s.pending_delete_id)
+    return in_flight
 
 
 # ------------------- START ENROLLMENT -------------------
@@ -78,7 +89,7 @@ def start_enrollment(
     # Generate new finger_id
     existing_ids = {u.finger_id for u in db.query(User.finger_id).all() if u.finger_id}
 
-    # NEW: don't reuse a finger_id that some device still has a pending
+    # Don't reuse a finger_id that some device still has a pending
     # delete for — it may still be "in flight" from a slow/offline device
     # even though the previous owner's row has already been cleared.
     existing_ids |= _finger_ids_in_flight(db)
@@ -95,14 +106,15 @@ def start_enrollment(
     user.enroll_status = EnrollmentStep.PENDING
     user.status = FingerprintStatus.PENDING
 
+    # Set device mode BEFORE commit so both happen atomically
+    set_mode_on_all_devices(db, "enroll")
+
     try:
         db.commit()
         db.refresh(user)
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-    set_mode_on_all_devices(db, "enroll")
 
     return {
         "message": "Enrollment started",
@@ -114,25 +126,39 @@ def start_enrollment(
 
 # ------------------- ESP32 POLLS FOR PENDING ENROLLMENT -------------------
 @router.get("/check-enrollment")
-def check_enrollment(req: Request, db: Session = Depends(get_db)):
+def check_enrollment(
+    req: Request,
+    device_id: str = DEFAULT_DEVICE_ID,
+    db: Session = Depends(get_db),
+):
     client_ip = req.client.host
 
-    # First check PENDING users
+    # First check PENDING users that haven't been claimed by any device yet
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
         .filter(User.enroll_status == EnrollmentStep.PENDING)
+        .filter(User.claimed_by_device.is_(None))  # not yet claimed
         .order_by(User.id.asc())
         .first()
     )
 
     if user:
+        # Atomically claim this user for this device so no other device
+        # picks up the same finger_id
+        user.claimed_by_device = device_id
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            return PlainTextResponse("none")
+
         log_request(
-            "CHECK-ENROLLMENT", client_ip, f"| Found finger_id={user.finger_id}"
+            "CHECK-ENROLLMENT", client_ip, f"| Found finger_id={user.finger_id} for device={device_id}"
         )
         return PlainTextResponse(str(user.finger_id))
 
-    # Check users in other enrollment steps
+    # Check users in other enrollment steps (resume) — these are already claimed
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
@@ -145,13 +171,14 @@ def check_enrollment(req: Request, db: Session = Depends(get_db)):
                 ]
             )
         )
+        .filter(User.claimed_by_device == device_id)  # only resume if claimed by THIS device
         .order_by(User.id.asc())
         .first()
     )
 
     if user:
         log_request(
-            "CHECK-ENROLLMENT", client_ip, f"| Resuming finger_id={user.finger_id}"
+            "CHECK-ENROLLMENT", client_ip, f"| Resuming finger_id={user.finger_id} on device={device_id}"
         )
         return PlainTextResponse(str(user.finger_id))
 
@@ -176,11 +203,7 @@ def update_enrollment(
     if not user:
         return PlainTextResponse("error")
 
-    # NEW: guard against stale/late messages from a device.
-    # If this user isn't actually mid-enrollment (or, for delete_success,
-    # is being confirmed for the wrong reason), a late callback could be
-    # about a *previous* holder of this finger_id. Only apply the
-    # transition if the user's current state is consistent with it.
+    # Guard against stale/late messages from a device.
     if status in ("place_finger", "remove_finger", "place_again", "success", "error"):
         if user.status != FingerprintStatus.PENDING:
             log_request(
@@ -207,11 +230,8 @@ def update_enrollment(
     enroll_step, fingerprint_status = status_map[status]
 
     if status == "delete_success":
-        # NEW: only apply this if some device actually has a pending
-        # delete recorded AGAINST THIS USER. A finger_id can be recycled
-        # to a new user between when a delete was dispatched and when a
-        # slow/offline device confirms it — without this check, that late
-        # confirmation would incorrectly unenroll the new owner instead.
+        # Only apply this if some device actually has a pending
+        # delete recorded AGAINST THIS USER.
         matching_state = (
             db.query(DeviceState)
             .filter_by(pending_delete_id=id, pending_delete_user_id=user.id)
@@ -231,24 +251,41 @@ def update_enrollment(
                 if s.pending_delete_id == id:
                     s.pending_delete_id = None
                     s.pending_delete_user_id = None
+                    s.pending_delete_updated_at = None
             db.commit()
             return PlainTextResponse("stale_ignored")
 
         user.enroll_status = enroll_step
         user.status = fingerprint_status
         user.finger_id = None
+        user.claimed_by_device = None
 
-        # Clear the pending delete on every device that was tracking it
+        # Clear the pending delete ONLY on the device that confirmed it
+        matching_state.pending_delete_id = None
+        matching_state.pending_delete_user_id = None
+        matching_state.pending_delete_updated_at = None
+
+    elif status == "delete_error":
+        # Clear the pending delete so the device doesn't keep retrying
+        # and the finger_id can be reused
         for s in get_all_device_states(db):
             if s.pending_delete_id == id:
                 s.pending_delete_id = None
                 s.pending_delete_user_id = None
-
-    elif status == "delete_error":
-        pass
+                s.pending_delete_updated_at = None
+        log_request(
+            "UPDATE-ENROLLMENT",
+            client_ip,
+            f"| finger_id={id} | delete_error — cleared pending_delete",
+        )
     else:
         user.enroll_status = enroll_step
         user.status = fingerprint_status
+
+        # On success or error, clear the claimed_by_device so the user
+        # can be re-enrolled later
+        if status in ("success", "error"):
+            user.claimed_by_device = None
 
     try:
         db.commit()
@@ -301,17 +338,19 @@ def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # NEW: also clear any pending_delete entries on devices that reference
+    # Also clear any pending_delete entries on devices that reference
     # this user, so a stray reset can't be followed by a stale delete
     # confirmation later.
     for s in get_all_device_states(db):
         if s.pending_delete_user_id == user.id:
             s.pending_delete_id = None
             s.pending_delete_user_id = None
+            s.pending_delete_updated_at = None
 
     user.finger_id = None
     user.enroll_status = EnrollmentStep.NOT_ENROLLED
     user.status = FingerprintStatus.NOT_ENROLLED
+    user.claimed_by_device = None
 
     try:
         db.commit()
@@ -345,10 +384,12 @@ def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_d
 
     ensure_all_devices_free(db, "delete")
 
+    now = datetime.utcnow()
     devices = get_all_device_states(db)
     for d in devices:
         d.pending_delete_id = user.finger_id
-        d.pending_delete_user_id = user.id  # NEW: ties this delete to this exact user
+        d.pending_delete_user_id = user.id
+        d.pending_delete_updated_at = now
         d.mode = "delete"
 
     try:
@@ -371,18 +412,29 @@ def check_delete(
     state = get_device_state(db, device_id)
 
     if state.pending_delete_id is not None:
+        # Check if this pending_delete has gone stale (device never confirmed)
+        now = datetime.utcnow()
+        stale_cutoff = now - timedelta(seconds=PENDING_DELETE_TIMEOUT_SECONDS)
+        if state.pending_delete_updated_at and state.pending_delete_updated_at < stale_cutoff:
+            # Auto-clear stale pending deletes
+            log_request(
+                "CHECK-DELETE",
+                client_ip,
+                f"| device={device_id} | CLEARING stale pending_delete_id={state.pending_delete_id}",
+            )
+            state.pending_delete_id = None
+            state.pending_delete_user_id = None
+            state.pending_delete_updated_at = None
+            state.mode = "idle"
+            db.commit()
+            return PlainTextResponse("none")
+
         finger_id = state.pending_delete_id
         log_request(
             "CHECK-DELETE",
             client_ip,
             f"| device={device_id} | Found finger_id={finger_id}",
         )
-        # NOTE: we intentionally do NOT clear pending_delete_id / pending_delete_user_id
-        # here anymore. It's only cleared once update-enrollment confirms the
-        # delete against the correct user (see update_enrollment). This keeps
-        # the "in flight" set accurate for start_enrollment's finger_id
-        # exclusion check — clearing it too early would let the ID be
-        # recycled before this device has actually finished the delete.
         db.commit()
         return PlainTextResponse(str(finger_id))
 
@@ -445,6 +497,25 @@ def mark_attendance(
     ongoing_event = db.query(Event).filter(Event.id == state.active_event_id).first()
     if not ongoing_event:
         return PlainTextResponse("no_active_event")
+
+    # Verify the event is actually ongoing by checking time range
+    ph_now = datetime.now(ph_tz)
+    event_start = datetime.combine(ongoing_event.event_date, ongoing_event.start_time)
+    event_end = datetime.combine(ongoing_event.event_date, ongoing_event.end_time)
+    # Make timezone-aware for comparison
+    ph_tz_local = pytz.timezone("Asia/Manila")
+    event_start = ph_tz_local.localize(event_start)
+    event_end = ph_tz_local.localize(event_end)
+    ph_now_aware = ph_tz_local.localize(ph_now)
+
+    if ph_now_aware < event_start or ph_now_aware > event_end:
+        log_request(
+            "MARK-ATTENDANCE",
+            client_ip,
+            f"| device={device_id} | finger_id={finger_id} | event not in progress "
+            f"(now={ph_now_aware}, start={event_start}, end={event_end})",
+        )
+        return PlainTextResponse("event_not_active")
 
     log_request(
         "MARK-ATTENDANCE",
@@ -544,15 +615,24 @@ def recognition_result(
 ):
     state = get_device_state(db, device_id)
 
-    if state.recognition_matched is not None:
+    # Use an atomic UPDATE to prevent race conditions between two devices.
+    # Only the first device to set recognition_matched will succeed.
+    from sqlalchemy import update
+    stmt = (
+        update(DeviceState)
+        .where(DeviceState.device_id == device_id)
+        .where(DeviceState.recognition_matched.is_(None))
+        .values(
+            recognition_matched=matched and (finger_id == state.recognition_target_id),
+            recognition_finger_id=state.recognition_target_id,
+            recognition_target_id=None,
+        )
+    )
+    result = db.execute(stmt)
+
+    if result.rowcount == 0:
+        # Another device already processed this, or state was already set
         return PlainTextResponse("already_processed")
-
-    target = state.recognition_target_id
-    actual_match = matched and (finger_id == target)
-
-    state.recognition_matched = actual_match
-    state.recognition_finger_id = target
-    state.recognition_target_id = None
 
     try:
         db.commit()
@@ -616,6 +696,7 @@ def debug_device_state(db: Session = Depends(get_db)):
                 "mode": s.mode,
                 "pending_delete_id": s.pending_delete_id,
                 "pending_delete_user_id": s.pending_delete_user_id,
+                "pending_delete_updated_at": s.pending_delete_updated_at,
                 "active_event_id": s.active_event_id,
                 "last_seen": s.last_seen,
                 "online": is_device_online(s),
@@ -628,6 +709,7 @@ def debug_device_state(db: Session = Depends(get_db)):
                 "finger_id": u.finger_id,
                 "status": u.status.value,
                 "enroll_status": u.enroll_status.value if u.enroll_status else None,
+                "claimed_by_device": u.claimed_by_device,
             }
             for u in pending_users
         ],
