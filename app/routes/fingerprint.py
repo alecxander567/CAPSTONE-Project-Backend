@@ -191,6 +191,7 @@ def update_enrollment(
     req: Request,
     id: int,
     status: str,
+    device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
 ):
     client_ip = req.client.host
