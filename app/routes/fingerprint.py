@@ -58,7 +58,10 @@ def _finger_ids_in_flight(db: Session) -> set[int]:
         if s.pending_delete_id is not None:
             # If the pending_delete has been sitting unresolved for too long,
             # treat it as stale and allow the finger_id to be recycled.
-            if s.pending_delete_updated_at and s.pending_delete_updated_at < stale_cutoff:
+            if (
+                s.pending_delete_updated_at
+                and s.pending_delete_updated_at < stale_cutoff
+            ):
                 continue
             in_flight.add(s.pending_delete_id)
     return in_flight
@@ -154,7 +157,9 @@ def check_enrollment(
             return PlainTextResponse("none")
 
         log_request(
-            "CHECK-ENROLLMENT", client_ip, f"| Found finger_id={user.finger_id} for device={device_id}"
+            "CHECK-ENROLLMENT",
+            client_ip,
+            f"| Found finger_id={user.finger_id} for device={device_id}",
         )
         return PlainTextResponse(str(user.finger_id))
 
@@ -171,14 +176,18 @@ def check_enrollment(
                 ]
             )
         )
-        .filter(User.claimed_by_device == device_id)  # only resume if claimed by THIS device
+        .filter(
+            User.claimed_by_device == device_id
+        )  # only resume if claimed by THIS device
         .order_by(User.id.asc())
         .first()
     )
 
     if user:
         log_request(
-            "CHECK-ENROLLMENT", client_ip, f"| Resuming finger_id={user.finger_id} on device={device_id}"
+            "CHECK-ENROLLMENT",
+            client_ip,
+            f"| Resuming finger_id={user.finger_id} on device={device_id}",
         )
         return PlainTextResponse(str(user.finger_id))
 
@@ -416,7 +425,10 @@ def check_delete(
         # Check if this pending_delete has gone stale (device never confirmed)
         now = datetime.utcnow()
         stale_cutoff = now - timedelta(seconds=PENDING_DELETE_TIMEOUT_SECONDS)
-        if state.pending_delete_updated_at and state.pending_delete_updated_at < stale_cutoff:
+        if (
+            state.pending_delete_updated_at
+            and state.pending_delete_updated_at < stale_cutoff
+        ):
             # Auto-clear stale pending deletes
             log_request(
                 "CHECK-DELETE",
@@ -619,6 +631,7 @@ def recognition_result(
     # Use an atomic UPDATE to prevent race conditions between two devices.
     # Only the first device to set recognition_matched will succeed.
     from sqlalchemy import update
+
     stmt = (
         update(DeviceState)
         .where(DeviceState.device_id == device_id)
@@ -635,11 +648,13 @@ def recognition_result(
         # Another device already processed this, or state was already set
         return PlainTextResponse("already_processed")
 
-    # Clear recognition fields on ALL devices so no device gets stuck
+    # Clear recognition_target_id on ALL devices so no device keeps scanning,
+    # but DO NOT clear recognition_finger_id / recognition_matched — those
+    # need to stay set so the frontend can poll get-recognition-result and
+    # read the outcome. Previously this loop wiped the result immediately
+    # after it was stored, so the frontend never saw it.
     for s in get_all_device_states(db):
         s.recognition_target_id = None
-        s.recognition_finger_id = None
-        s.recognition_matched = None
 
     try:
         db.commit()
@@ -659,14 +674,20 @@ def get_recognition_result(
     device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
 ):
-    state = get_device_state(db, device_id)
-
-    if state.recognition_finger_id == finger_id:
-        matched = state.recognition_matched
-        state.recognition_finger_id = None
-        state.recognition_matched = None
-        db.commit()
-        return {"status": "done", "matched": matched}
+    # The ESP32 that actually scanned the finger may have a different
+    # device_id (e.g. "esp32-1") than the one the frontend is polling
+    # (defaults to "esp32-default"). Since recognition is a system-wide
+    # exclusive operation, check ALL device states for a matching result
+    # instead of just the one the frontend asked about.
+    for state in get_all_device_states(db):
+        if state.recognition_finger_id == finger_id:
+            matched = state.recognition_matched
+            # Clear the result on every device so nothing stays stale.
+            for s in get_all_device_states(db):
+                s.recognition_finger_id = None
+                s.recognition_matched = None
+            db.commit()
+            return {"status": "done", "matched": matched}
 
     return {"status": "pending"}
 
@@ -689,6 +710,7 @@ def debug_all_enrolled(db: Session = Depends(get_db)):
 
 
 # ------------------- DEBUG DEVICE STATE (all devices) -------------------
+# ------------------- DEBUG DEVICE STATE (all devices) -------------------
 @router.get("/debug/device-state")
 def debug_device_state(db: Session = Depends(get_db)):
     db.expire_all()
@@ -701,6 +723,9 @@ def debug_device_state(db: Session = Depends(get_db)):
             {
                 "device_id": s.device_id,
                 "mode": s.mode,
+                "recognition_target_id": s.recognition_target_id,
+                "recognition_finger_id": s.recognition_finger_id,
+                "recognition_matched": s.recognition_matched,
                 "pending_delete_id": s.pending_delete_id,
                 "pending_delete_user_id": s.pending_delete_user_id,
                 "pending_delete_updated_at": s.pending_delete_updated_at,
