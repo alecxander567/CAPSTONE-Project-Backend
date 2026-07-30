@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from contextlib import asynccontextmanager
+from sqlalchemy import text
 from app.core.database import engine, Base
 from app.routes import (
     auth,
@@ -63,6 +64,18 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
+
+# ── Add new columns if missing (for existing tables) ──────────────────────
+# The create_all above only CREATES new tables, it doesn't ALTER existing
+# ones.  Raw SQL below adds the columns introduced in this PR safely.
+try:
+    with engine.connect() as conn:
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS claimed_by_device VARCHAR(50)"))
+        conn.execute(text("ALTER TABLE device_state ADD COLUMN IF NOT EXISTS pending_delete_updated_at TIMESTAMP"))
+        conn.commit()
+except Exception as e:
+    logging.warning(f"Could not add new columns (expected if they already exist): {e}")
+# ─────────────────────────────────────────────────────────────────────────
 
 # Include routers
 app.include_router(auth.router)

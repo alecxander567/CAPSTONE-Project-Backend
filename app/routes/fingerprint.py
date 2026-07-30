@@ -635,6 +635,12 @@ def recognition_result(
         # Another device already processed this, or state was already set
         return PlainTextResponse("already_processed")
 
+    # Clear recognition fields on ALL devices so no device gets stuck
+    for s in get_all_device_states(db):
+        s.recognition_target_id = None
+        s.recognition_finger_id = None
+        s.recognition_matched = None
+
     try:
         db.commit()
     except Exception as e:
