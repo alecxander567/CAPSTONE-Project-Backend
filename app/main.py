@@ -47,9 +47,10 @@ app.add_middleware(
         "https://ara-system-app.vercel.app",
         "https://ara-system-51e92eids-alecxander567s-projects.vercel.app",
         "http://localhost:5173",
+        "https://ara-system-app-git-main-alecxander567s-projects.vercel.app",
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
