@@ -512,14 +512,15 @@ def mark_attendance(
         return PlainTextResponse("no_active_event")
 
     # Verify the event is actually ongoing by checking time range
-    ph_now = datetime.now(ph_tz)
+    ph_tz_local = pytz.timezone("Asia/Manila")
+
+    ph_now_aware = datetime.now(ph_tz_local)  # already tz-aware, don't localize again
+
     event_start = datetime.combine(ongoing_event.event_date, ongoing_event.start_time)
     event_end = datetime.combine(ongoing_event.event_date, ongoing_event.end_time)
-    # Make timezone-aware for comparison
-    ph_tz_local = pytz.timezone("Asia/Manila")
+    # These ARE naive (built from combine()), so localize() is correct here
     event_start = ph_tz_local.localize(event_start)
     event_end = ph_tz_local.localize(event_end)
-    ph_now_aware = ph_tz_local.localize(ph_now)
 
     if ph_now_aware < event_start or ph_now_aware > event_end:
         log_request(
@@ -709,7 +710,6 @@ def debug_all_enrolled(db: Session = Depends(get_db)):
     ]
 
 
-# ------------------- DEBUG DEVICE STATE (all devices) -------------------
 # ------------------- DEBUG DEVICE STATE (all devices) -------------------
 @router.get("/debug/device-state")
 def debug_device_state(db: Session = Depends(get_db)):
