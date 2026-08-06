@@ -14,7 +14,7 @@ from app.routes import (
     attendance,
     device,
 )
-from app.routes.notification_ws import websocket_endpoint
+from app.routes.notification_ws import websocket_endpoint, manager
 from app.core.background_task import event_notifier_loop
 from app.routes.health import router as health
 import asyncio
@@ -27,6 +27,8 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    manager.set_loop(asyncio.get_running_loop())
+
     notifier_task = asyncio.create_task(event_notifier_loop())
     try:
         yield

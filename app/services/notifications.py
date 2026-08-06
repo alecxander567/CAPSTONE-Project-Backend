@@ -4,13 +4,13 @@ from sqlalchemy.exc import IntegrityError
 from app.models import Notification, Event, User
 import logging
 from app.services.firebase_service import send_push_notification
+from app.routes.notification_ws import manager
 import threading
 
 logger = logging.getLogger(__name__)
 
 _sent_notifications = set()
 
-# Philippine Time (UTC+8)
 PH_TZ = timezone(timedelta(hours=8))
 
 
@@ -28,7 +28,6 @@ def notify_today_events(db: Session):
         event_datetime = datetime.combine(event.event_date, event.start_time)
         time_diff = (event_datetime - now).total_seconds()
 
-        # Only notify within 30 mins before event
         if not (-60 < time_diff <= 1800):
             continue
 
@@ -40,7 +39,6 @@ def notify_today_events(db: Session):
             if notification_key in _sent_notifications:
                 continue
 
-            # Check if notification already exists (DB protection)
             existing = (
                 db.query(Notification)
                 .filter(
@@ -78,11 +76,20 @@ def notify_today_events(db: Session):
                     f"Notification {notification.id} created for user {user.id}, event {event.id}"
                 )
 
+                manager.notify_user_sync(user.id, {
+                    "id": notification.id,
+                    "user_id": user.id,
+                    "event_id": event.id,
+                    "title": notification.title,
+                    "message": notification.message,
+                    "type": notification.type,
+                    "is_read": notification.is_read,
+                    "timestamp": notification.timestamp.isoformat() if notification.timestamp else None,
+                })
+
                 if user.device_token and user.device_token not in sent_tokens:
                     sent_tokens.add(user.device_token)
-
                     minutes_remaining = max(1, int(time_diff // 60))
-
                     threading.Thread(
                         target=send_push_notification,
                         args=(
@@ -96,9 +103,7 @@ def notify_today_events(db: Session):
             except IntegrityError:
                 db.rollback()
                 _sent_notifications.add(notification_key)
-                logger.warning(
-                    f"Duplicate prevented by DB constraint: {notification_key}"
-                )
+                logger.warning(f"Duplicate prevented by DB constraint: {notification_key}")
 
             except Exception as e:
                 db.rollback()

@@ -1,128 +1,125 @@
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
-from datetime import datetime
-from app.core.database import get_db
+from sqlalchemy.exc import IntegrityError
 from app.models import Notification, Event, User
-from app.routes.notification_ws import manager
-from app.core.security import get_current_user
+import logging
 from app.services.firebase_service import send_push_notification
-from pydantic import BaseModel
+from app.routes.notification_ws import manager
+import threading
 
-router = APIRouter(prefix="/notifications", tags=["Notifications"])
+logger = logging.getLogger(__name__)
+
+_sent_notifications = set()
+
+# Philippine Time (UTC+8)
+PH_TZ = timezone(timedelta(hours=8))
 
 
-class DeviceTokenRequest(BaseModel):
-    token: str
+def notify_today_events(db: Session):
+    now = datetime.now(PH_TZ).replace(tzinfo=None)
+    today = now.date()
 
+    events_today = db.query(Event).filter(Event.event_date == today).all()
+    if not events_today:
+        return
 
-# ------------------- GETS CURRENT USER NOTIFICATION -------------------
-@router.get("/")
-def get_notifications(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    try:
+    users = db.query(User).all()
 
-        notifications = (
-            db.query(Notification)
-            .filter(Notification.user_id == current_user.id)
-            .order_by(Notification.id.desc())
-            .all()
-        )
+    for event in events_today:
+        event_datetime = datetime.combine(event.event_date, event.start_time)
+        time_diff = (event_datetime - now).total_seconds()
 
-        result = []
-        for n in notifications:
-            result.append(
-                {
-                    "id": n.id,
-                    "user_id": n.user_id,
-                    "event_id": n.event_id,
-                    "title": n.title,
-                    "message": n.message,
-                    "type": n.type,
-                    "is_read": n.is_read,
-                    "timestamp": n.timestamp.isoformat() if n.timestamp else None,
-                }
+        # Only notify within 30 mins before event
+        if not (-60 < time_diff <= 1800):
+            continue
+
+        sent_tokens = set()
+
+        for user in users:
+            notification_key = f"event_{event.id}_user_{user.id}"
+
+            if notification_key in _sent_notifications:
+                continue
+
+            # Check if notification already exists (DB protection)
+            existing = (
+                db.query(Notification)
+                .filter(
+                    Notification.user_id == user.id,
+                    Notification.event_id == event.id,
+                    Notification.type == "event",
+                )
+                .first()
             )
 
-        return result
+            if existing:
+                _sent_notifications.add(notification_key)
+                continue
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            notification = Notification(
+                user_id=user.id,
+                event_id=event.id,
+                title=event.title,
+                message=(
+                    f"{event.description}\n\n"
+                    f"Starts at {event.start_time.strftime('%I:%M %p')}"
+                ),
+                type="event",
+                is_read=False,
+            )
 
+            try:
+                db.add(notification)
+                db.commit()
+                db.refresh(notification)
 
-# ------------------- MARK NOTIFICATION AS READ -------------------
-@router.patch("/{notification_id}/read")
-def mark_notification_as_read(
-    notification_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    notification = (
-        db.query(Notification)
-        .filter(
-            Notification.id == notification_id, Notification.user_id == current_user.id
-        )
-        .first()
-    )
+                _sent_notifications.add(notification_key)
 
-    if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+                logger.info(
+                    f"Notification {notification.id} created for user {user.id}, event {event.id}"
+                )
 
-    notification.is_read = True
-    db.commit()
+                # --- push over websocket to this user only ---
+                manager.notify_user_sync(user.id, {
+                    "id": notification.id,
+                    "user_id": user.id,
+                    "event_id": event.id,
+                    "title": notification.title,
+                    "message": notification.message,
+                    "type": notification.type,
+                    "is_read": notification.is_read,
+                    "timestamp": notification.timestamp.isoformat() if notification.timestamp else None,
+                })
 
-    return {"status": "success", "id": notification_id}
+                if user.device_token and user.device_token not in sent_tokens:
+                    sent_tokens.add(user.device_token)
 
+                    minutes_remaining = max(1, int(time_diff // 60))
 
-# ------------------- DELETE NOTIFICATION -------------------
-@router.delete("/{notification_id}")
-def delete_notification(
-    notification_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    notification = (
-        db.query(Notification)
-        .filter(
-            Notification.id == notification_id, Notification.user_id == current_user.id
-        )
-        .first()
-    )
+                    threading.Thread(
+                        target=send_push_notification,
+                        args=(
+                            user.device_token,
+                            f"EVENT REMINDER: {event.title}",
+                            f"Starting in {minutes_remaining} minute{'s' if minutes_remaining != 1 else ''} at {event.start_time.strftime('%I:%M %p')}\n{event.description}",
+                        ),
+                        daemon=True,
+                    ).start()
 
-    if not notification:
-        raise HTTPException(status_code=404, detail="Notification not found")
+            except IntegrityError:
+                db.rollback()
+                _sent_notifications.add(notification_key)
+                logger.warning(
+                    f"Duplicate prevented by DB constraint: {notification_key}"
+                )
 
-    db.delete(notification)
-    db.commit()
-
-    return {"status": "deleted", "id": notification_id}
-
-
-# ------------------- DELETE ALL NOTIFICATIONS -------------------
-@router.delete("/")
-def delete_all_notifications(
-    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
-):
-    try:
-        count = (
-            db.query(Notification)
-            .filter(Notification.user_id == current_user.id)
-            .delete()
-        )
-        db.commit()
-        return {"status": "success", "deleted_count": count}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+            except Exception as e:
+                db.rollback()
+                logger.error(f"Failed to create notification: {e}")
 
 
-@router.post("/save-token")
-def save_device_token(
-    body: DeviceTokenRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    current_user.device_token = body.token
-    db.commit()
-    return {"status": "token saved"}
+def clear_notification_cache():
+    global _sent_notifications
+    count = len(_sent_notifications)
+    _sent_notifications.clear()
+    logger.info(f"Notification cache cleared ({count} entries removed)")
