@@ -1,4 +1,4 @@
-from fastapi import WebSocket, WebSocketDisconnect, Query
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from typing import Dict, List, Optional
 import asyncio
 import logging
@@ -7,6 +7,8 @@ import jwt
 from app.core.security import SECRET_KEY, ALGORITHM
 
 logger = logging.getLogger(__name__)
+
+router = APIRouter()
 
 
 class ConnectionManager:
@@ -20,7 +22,9 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket, user_id: int):
         await websocket.accept()
         self.active_connections.setdefault(user_id, []).append(websocket)
-        logger.info(f"WS connected for user {user_id} ({len(self.active_connections[user_id])} sockets)")
+        logger.info(
+            f"WS connected for user {user_id} ({len(self.active_connections[user_id])} sockets)"
+        )
 
     def disconnect(self, websocket: WebSocket, user_id: int):
         conns = self.active_connections.get(user_id)
@@ -42,7 +46,9 @@ class ConnectionManager:
 
     def notify_user_sync(self, user_id: int, message: dict):
         if self.loop is None:
-            logger.warning("No event loop registered on ConnectionManager; skipping WS push")
+            logger.warning(
+                "No event loop registered on ConnectionManager; skipping WS push"
+            )
             return
         if user_id not in self.active_connections:
             return
@@ -67,6 +73,7 @@ def _get_user_id_from_token(token: str) -> Optional[int]:
         return None
 
 
+@router.websocket("/ws/notifications/")
 async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = Query(None)):
     if not token:
         await websocket.close(code=4401)
