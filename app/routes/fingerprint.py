@@ -191,6 +191,22 @@ def check_enrollment(
         )
         return PlainTextResponse(str(user.finger_id))
 
+    # SELF-HEAL: this device is in "enroll" mode (the ESP32 only calls
+    # check-enrollment when device-mode == "enroll") but there is no pending
+    # unclaimed user and no enrollment this device can resume — i.e. the
+    # enrollment was cancelled/disregarded with nothing left to do. Return this
+    # device to idle so it stops spinning on check-enrollment forever and
+    # doesn't keep ensure_all_devices_free blocking every other operation.
+    state = get_device_state(db, device_id)
+    if state.mode == "enroll":
+        log_request(
+            "CHECK-ENROLLMENT",
+            client_ip,
+            f"| device={device_id} | no pending work -> returning to idle",
+        )
+        state.mode = "idle"
+        db.commit()
+
     return PlainTextResponse("none")
 
 
@@ -504,6 +520,19 @@ def check_delete(
         )
         db.commit()
         return PlainTextResponse(str(finger_id))
+
+    # SELF-HEAL: this device is in "delete" mode (the ESP32 only calls
+    # check-delete when device-mode == "delete") but the pending_delete was
+    # cleared (e.g. cancelled / disregarded / reset) — nothing left to do.
+    # Return it to idle so it stops polling check-delete forever.
+    if state.mode == "delete":
+        log_request(
+            "CHECK-DELETE",
+            client_ip,
+            f"| device={device_id} | no pending delete -> returning to idle",
+        )
+        state.mode = "idle"
+        db.commit()
 
     return PlainTextResponse("none")
 
