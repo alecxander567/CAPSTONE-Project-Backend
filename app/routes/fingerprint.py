@@ -422,9 +422,7 @@ def cancel_operation(db: Session = Depends(get_db)):
     # Roll back any user left mid-enrollment by the cancelled operation so they
     # don't stay PENDING forever (device would keep being told to resume them).
     pending_users = (
-        db.query(User)
-        .filter(User.status == FingerprintStatus.PENDING)
-        .all()
+        db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
     )
     for u in pending_users:
         u.finger_id = None
@@ -828,4 +826,60 @@ def debug_device_state(db: Session = Depends(get_db)):
             }
             for u in pending_users
         ],
+    }
+
+
+# ------------------- LIST STUCK/PENDING ENROLLMENTS -------------------
+@router.get("/pending-enrollments")
+def get_pending_enrollments(db: Session = Depends(get_db)):
+    """List users currently stuck in a PENDING enrollment (e.g. dropped connection mid-enroll)."""
+    users = db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
+    return [
+        {
+            "user_id": u.id,
+            "student_id_no": u.student_id_no,
+            "name": f"{u.first_name} {u.last_name}",
+            "finger_id": u.finger_id,
+            "enroll_status": u.enroll_status.value if u.enroll_status else None,
+            "claimed_by_device": u.claimed_by_device,
+        }
+        for u in users
+    ]
+
+
+# ------------------- BULK CLEAR STUCK ENROLLMENTS -------------------
+@router.post("/clear-pending-enrollments")
+def clear_pending_enrollments(db: Session = Depends(get_db)):
+    """
+    Bulk-clear every user stuck in PENDING back to NOT_ENROLLED, and return
+    only devices that were in "enroll" mode back to idle. Unlike
+    cancel-operation, this leaves delete/recognize/attendance state on other
+    devices untouched.
+    """
+    pending_users = (
+        db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
+    )
+
+    if not pending_users:
+        return {"message": "No pending enrollments to clear", "cleared": 0}
+
+    for u in pending_users:
+        u.finger_id = None
+        u.enroll_status = EnrollmentStep.NOT_ENROLLED
+        u.status = FingerprintStatus.NOT_ENROLLED
+        u.claimed_by_device = None
+
+    for d in get_all_device_states(db):
+        if d.mode == "enroll":
+            d.mode = "idle"
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+    return {
+        "message": f"Cleared {len(pending_users)} pending enrollment(s)",
+        "cleared": len(pending_users),
     }
