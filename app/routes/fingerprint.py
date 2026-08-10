@@ -362,6 +362,12 @@ def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
     user.status = FingerprintStatus.NOT_ENROLLED
     user.claimed_by_device = None
 
+    # A reset is effectively a cancel of enrollment, so return every device
+    # to idle too. Otherwise the device stays stuck in "enroll" mode forever
+    # (see cancel_operation below) and ensure_all_devices_free blocks every
+    # subsequent operation with a 409.
+    set_mode_on_all_devices(db, "idle")
+
     try:
         db.commit()
     except Exception as e:
@@ -369,6 +375,54 @@ def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
     return {"message": "Enrollment reset successfully"}
+
+
+# ------------------- CANCEL / DISREGARD ANY ONGOING OPERATION -------------------
+@router.post("/cancel-operation")
+def cancel_operation(db: Session = Depends(get_db)):
+    """
+    Abort/disregard any in-progress exclusive operation (enroll / delete /
+    recognize / attendance) and return every device to idle.
+
+    This is what the dashboard's Cancel button calls. Without it, a device
+    stays stuck in the started mode ('enroll' / 'delete' / 'recognize') for
+    as long as the only other ways back to idle are the device completing the
+    op (update-enrollment / recognition-result) or a stale timeout — which
+    leaves ensure_all_devices_free blocking every later operation with a 409.
+    """
+    log_request("CANCEL-OPERATION", "dashboard")
+
+    # Return all devices to idle and clear ALL residual per-device op state.
+    for d in get_all_device_states(db):
+        d.mode = "idle"
+        d.pending_delete_id = None
+        d.pending_delete_user_id = None
+        d.pending_delete_updated_at = None
+        d.recognition_target_id = None
+        d.recognition_finger_id = None
+        d.recognition_matched = None
+        d.active_event_id = None
+
+    # Roll back any user left mid-enrollment by the cancelled operation so they
+    # don't stay PENDING forever (device would keep being told to resume them).
+    pending_users = (
+        db.query(User)
+        .filter(User.status == FingerprintStatus.PENDING)
+        .all()
+    )
+    for u in pending_users:
+        u.finger_id = None
+        u.enroll_status = EnrollmentStep.NOT_ENROLLED
+        u.status = FingerprintStatus.NOT_ENROLLED
+        u.claimed_by_device = None
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+    return {"message": "All devices reset to idle; operation cancelled"}
 
 
 # ------------------- UNENROLL FINGERPRINT -------------------
