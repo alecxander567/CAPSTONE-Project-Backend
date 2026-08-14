@@ -48,10 +48,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://ara-system-app.vercel.app",
-        "https://ara-system-51e92eids-alecxander567s-projects.vercel.app",
-        "http://localhost:5173",
         "https://ara-system-app-git-main-alecxander567s-projects.vercel.app",
+        "http://localhost:5173",
     ],
+    allow_origin_regex=r"https://ara-system-[a-z0-9]+-alecxander567s-projects\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -72,8 +72,16 @@ Base.metadata.create_all(bind=engine)
 # ones.  Raw SQL below adds the columns introduced in this PR safely.
 try:
     with engine.connect() as conn:
-        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS claimed_by_device VARCHAR(50)"))
-        conn.execute(text("ALTER TABLE device_state ADD COLUMN IF NOT EXISTS pending_delete_updated_at TIMESTAMP"))
+        conn.execute(
+            text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS claimed_by_device VARCHAR(50)"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE device_state ADD COLUMN IF NOT EXISTS pending_delete_updated_at TIMESTAMP"
+            )
+        )
         conn.commit()
 except Exception as e:
     logging.warning(f"Could not add new columns (expected if they already exist): {e}")
