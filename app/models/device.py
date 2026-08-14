@@ -13,10 +13,16 @@ class DeviceState(Base):
     pending_delete_user_id = Column(
         Integer, nullable=True
     )  # ties the delete to a specific user
-    pending_delete_updated_at = Column(DateTime, nullable=True)  # when the delete was last set
+    pending_delete_updated_at = Column(
+        DateTime, nullable=True
+    )  # when the delete was last set
 
     recognition_finger_id = Column(Integer, nullable=True)
     recognition_matched = Column(Boolean, nullable=True)
     recognition_target_id = Column(Integer, nullable=True)
+    recognition_updated_at = Column(
+        DateTime, nullable=True
+    )  # when recognition was last started/updated
+
     last_seen = Column(DateTime, nullable=True)
     active_event_id = Column(Integer, ForeignKey("events.id"), nullable=True)

@@ -687,6 +687,7 @@ def start_recognition(user_id: int, db: Session = Depends(get_db)):
         d.recognition_target_id = user.finger_id
         d.recognition_finger_id = None
         d.recognition_matched = None
+        d.recognition_updated_at = datetime.utcnow()  # NEW
 
     try:
         db.commit()
@@ -710,8 +711,11 @@ def recognition_result(
 ):
     state = get_device_state(db, device_id)
 
-    # Use an atomic UPDATE to prevent race conditions between two devices.
-    # Only the first device to set recognition_matched will succeed.
+    # NEW: ignore a scan that arrives when there's no active recognition
+    # session on this device (e.g. late/duplicate ESP32 report)
+    if state.recognition_target_id is None:
+        return PlainTextResponse("no_active_recognition")
+
     from sqlalchemy import update
 
     stmt = (
@@ -720,21 +724,15 @@ def recognition_result(
         .where(DeviceState.recognition_matched.is_(None))
         .values(
             recognition_matched=matched and (finger_id == state.recognition_target_id),
-            recognition_finger_id=state.recognition_target_id,
+            recognition_finger_id=finger_id,  # CHANGED: store the actual scanned id, not the target
             recognition_target_id=None,
         )
     )
     result = db.execute(stmt)
 
     if result.rowcount == 0:
-        # Another device already processed this, or state was already set
         return PlainTextResponse("already_processed")
 
-    # Clear recognition_target_id on ALL devices so no device keeps scanning,
-    # but DO NOT clear recognition_finger_id / recognition_matched — those
-    # need to stay set so the frontend can poll get-recognition-result and
-    # read the outcome. Previously this loop wiped the result immediately
-    # after it was stored, so the frontend never saw it.
     for s in get_all_device_states(db):
         s.recognition_target_id = None
 
@@ -756,20 +754,42 @@ def get_recognition_result(
     device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
 ):
-    # The ESP32 that actually scanned the finger may have a different
-    # device_id (e.g. "esp32-1") than the one the frontend is polling
-    # (defaults to "esp32-default"). Since recognition is a system-wide
-    # exclusive operation, check ALL device states for a matching result
-    # instead of just the one the frontend asked about.
+    # NEW: self-heal a stale/stuck recognition session
+    now = datetime.utcnow()
+    stale_cutoff = now - timedelta(seconds=60)
+
     for state in get_all_device_states(db):
-        if state.recognition_finger_id == finger_id:
+        if (
+            state.mode == "recognize"
+            and state.recognition_target_id is not None
+            and state.recognition_updated_at
+            and state.recognition_updated_at < stale_cutoff
+        ):
+            state.recognition_target_id = None
+            state.recognition_matched = None
+            state.recognition_finger_id = None
+            state.recognition_updated_at = None
+            state.mode = "idle"
+            db.commit()
+            return {"status": "timeout"}
+
+    # CHANGED: match on recognition_matched being set (session complete),
+    # not on recognition_finger_id == finger_id (which breaks on a
+    # legitimate wrong-finger scan)
+    for state in get_all_device_states(db):
+        if state.recognition_matched is not None:
             matched = state.recognition_matched
-            # Clear the result on every device so nothing stays stale.
+            scanned_id = state.recognition_finger_id
             for s in get_all_device_states(db):
                 s.recognition_finger_id = None
                 s.recognition_matched = None
+                s.recognition_updated_at = None
             db.commit()
-            return {"status": "done", "matched": matched}
+            return {
+                "status": "done",
+                "matched": matched,
+                "scanned_finger_id": scanned_id,
+            }
 
     return {"status": "pending"}
 
