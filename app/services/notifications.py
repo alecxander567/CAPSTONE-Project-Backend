@@ -4,7 +4,6 @@ from sqlalchemy.exc import IntegrityError
 from app.models import Notification, Event, User
 import logging
 from app.services.firebase_service import send_push_notification
-from app.routes.notification_ws import manager
 import threading
 
 logger = logging.getLogger(__name__)
@@ -76,16 +75,8 @@ def notify_today_events(db: Session):
                     f"Notification {notification.id} created for user {user.id}, event {event.id}"
                 )
 
-                manager.notify_user_sync(user.id, {
-                    "id": notification.id,
-                    "user_id": user.id,
-                    "event_id": event.id,
-                    "title": notification.title,
-                    "message": notification.message,
-                    "type": notification.type,
-                    "is_read": notification.is_read,
-                    "timestamp": notification.timestamp.isoformat() if notification.timestamp else None,
-                })
+                # NOTE: no websocket push anymore — the frontend picks this up
+                # on its next poll of GET /notifications/
 
                 if user.device_token and user.device_token not in sent_tokens:
                     sent_tokens.add(user.device_token)
@@ -103,7 +94,9 @@ def notify_today_events(db: Session):
             except IntegrityError:
                 db.rollback()
                 _sent_notifications.add(notification_key)
-                logger.warning(f"Duplicate prevented by DB constraint: {notification_key}")
+                logger.warning(
+                    f"Duplicate prevented by DB constraint: {notification_key}"
+                )
 
             except Exception as e:
                 db.rollback()

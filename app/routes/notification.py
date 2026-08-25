@@ -3,7 +3,6 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 from app.core.database import get_db
 from app.models import Notification, Event, User
-from app.routes.notification_ws import manager
 from app.core.security import get_current_user
 from app.services.firebase_service import send_push_notification
 from pydantic import BaseModel

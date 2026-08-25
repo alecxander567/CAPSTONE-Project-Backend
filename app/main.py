@@ -14,7 +14,6 @@ from app.routes import (
     attendance,
     device,
 )
-from app.routes.notification_ws import websocket_endpoint, manager
 from app.core.background_task import event_notifier_loop
 from app.routes.health import router as health
 import asyncio
@@ -27,8 +26,6 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    manager.set_loop(asyncio.get_running_loop())
-
     notifier_task = asyncio.create_task(event_notifier_loop())
     try:
         yield
@@ -68,8 +65,6 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 Base.metadata.create_all(bind=engine)
 
 # ── Add new columns if missing (for existing tables) ──────────────────────
-# The create_all above only CREATES new tables, it doesn't ALTER existing
-# ones.  Raw SQL below adds the columns introduced in this PR safely.
 try:
     with engine.connect() as conn:
         conn.execute(
@@ -94,7 +89,6 @@ app.include_router(events.router)
 app.include_router(notification.router)
 app.include_router(fingerprint.router)
 app.include_router(attendance.router)
-app.websocket("/ws/notifications/")(websocket_endpoint)
 app.include_router(device.router)
 app.include_router(health)
 
