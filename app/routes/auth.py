@@ -23,7 +23,9 @@ from app.core.security import blacklist_token
 from app.models.token_blacklist import TokenBlacklist
 import cloudinary
 import cloudinary.uploader
-import resend
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -43,8 +45,11 @@ cloudinary.config(
     secure=True,
 )
 
-# ------------------- RESEND (EMAIL) CONFIG -------------------
-resend.api_key = os.environ["RESEND_API_KEY"]
+# ------------------- GMAIL SMTP (EMAIL) CONFIG -------------------
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+SMTP_USER = os.environ["SMTP_USER"]
+SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
 
 # Falls back to your deployed frontend if FRONTEND_URL isn't set in the env.
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://ara-system-app.vercel.app")
@@ -52,30 +57,31 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://ara-system-app.vercel.app
 
 def send_reset_email(to_email: str, reset_link: str):
     """
-    Sends the password reset link via Resend.
+    Sends the password reset link via Gmail SMTP.
 
-    NOTE: Resend's shared "onboarding@resend.dev" sender only delivers to the
-    email address you signed up to Resend with (sandbox mode). To send to
-    ANY user's real email in production, you need to verify your own domain
-    in the Resend dashboard and send from an address on that domain
-    (e.g. no-reply@yourdomain.com). Until then, this will silently fail or
-    bounce for real users.
+    Requires a Gmail account with 2-Step Verification enabled, and an
+    App Password generated at https://myaccount.google.com/apppasswords.
+    SMTP_USER and SMTP_PASSWORD must be set in the environment.
     """
-    resend.Emails.send(
-        {
-            "from": os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev"),
-            "to": [to_email],
-            "subject": "Reset your password",
-            "html": f"""
-                <p>We received a request to reset your password.</p>
-                <p>
-                    <a href="{reset_link}">Click here to reset your password</a>
-                </p>
-                <p>This link expires in 15 minutes. If you didn't request this,
-                you can safely ignore this email.</p>
-            """,
-        }
-    )
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "Reset your password"
+    msg["From"] = SMTP_USER
+    msg["To"] = to_email
+
+    html = f"""
+        <p>We received a request to reset your password.</p>
+        <p>
+            <a href="{reset_link}">Click here to reset your password</a>
+        </p>
+        <p>This link expires in 15 minutes. If you didn't request this,
+        you can safely ignore this email.</p>
+    """
+    msg.attach(MIMEText(html, "html"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_USER, [to_email], msg.as_string())
 
 
 # ------------------- REGISTER -------------------
@@ -85,25 +91,21 @@ def send_reset_email(to_email: str, reset_link: str):
 def register_user(user: UserCreate, db: Session = Depends(get_db)):
     from app.models.programs import Program
 
-    # CHECK IF ADMIN EXISTS
     existing_admin = db.query(User).filter(User.role == UserRole.ADMIN).first()
 
     if existing_admin:
-        # If admin already exists → force role to STUDENT
         if user.role == UserRole.ADMIN:
             raise HTTPException(
                 status_code=403,
                 detail="Administrator account already exists. Only students can register.",
             )
     else:
-        # If no admin exists → allow first admin only
         if user.role != UserRole.ADMIN:
             raise HTTPException(
                 status_code=403,
                 detail="First registered account must be an administrator.",
             )
 
-    # EMAIL CHECK
     existing_email = db.query(User).filter(User.email == user.email).first()
     if existing_email:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -115,7 +117,6 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
         if existing_student:
             raise HTTPException(status_code=400, detail="Student ID already registered")
 
-    # ASSIGN PROGRAM AND YEAR LEVEL
     program_id = user.program_id
     year_level = user.year_level
 
@@ -170,7 +171,6 @@ def login(login_data: UserLogin, db: Session = Depends(get_db)):
             detail="Invalid student ID or password",
         )
 
-    # Create JWT token
     token_data = {"user_id": user.id, "role": user.role.value}
     access_token = create_access_token(token_data)
 
@@ -189,19 +189,14 @@ def logout(
 ):
     """Logout user by blacklisting their token"""
     try:
-        # Extract token from Authorization header
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Invalid authorization header")
 
         token = authorization.split(" ")[1]
-
-        # Add token to blacklist
         blacklist_token(token, db)
 
         return {"message": "Logged out successfully"}
     except Exception as e:
-        # Still return success to frontend even if token extraction fails
-        # This ensures frontend still clears local storage
         return {"message": "Logged out successfully"}
 
 
@@ -210,8 +205,6 @@ def logout(
 def forgot_password(data: ForgotPasswordSchema, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == data.email.strip().lower()).first()
 
-    # Always return the same generic response whether or not the email
-    # exists — prevents leaking which emails are registered.
     generic_response = {
         "message": "If that email is registered, a reset link has been sent."
     }
@@ -222,7 +215,6 @@ def forgot_password(data: ForgotPasswordSchema, db: Session = Depends(get_db)):
     token = secrets.token_urlsafe(32)
     expires = datetime.utcnow() + timedelta(minutes=15)
 
-    # Delete any existing reset tokens for this user
     db.query(PasswordReset).filter(PasswordReset.user_id == user.id).delete()
 
     reset = PasswordReset(user_id=user.id, token=token, expires_at=expires)
@@ -234,8 +226,6 @@ def forgot_password(data: ForgotPasswordSchema, db: Session = Depends(get_db)):
     try:
         send_reset_email(user.email, reset_link)
     except Exception as e:
-        # Don't leak email-provider errors to the client — log and still
-        # return the generic response so behavior stays consistent.
         print(f"Failed to send reset email: {e}")
 
     return generic_response
@@ -304,7 +294,6 @@ def update_user_profile(
 
     is_admin = current_user.role == UserRole.ADMIN
 
-    # HARD BLOCK: admins can never set program or year_level, no matter what
     if is_admin and (
         profile_data.program is not None or profile_data.year_level is not None
     ):
@@ -313,7 +302,6 @@ def update_user_profile(
             detail="Admin users cannot update program or year level",
         )
 
-    # student_id_no — allowed for everyone (admin + student)
     if profile_data.student_id_no is not None:
         existing_student = (
             db.query(User)
@@ -327,7 +315,6 @@ def update_user_profile(
             raise HTTPException(status_code=400, detail="Student ID already registered")
         current_user.student_id_no = profile_data.student_id_no
 
-    # email — allowed for everyone
     if profile_data.email is not None:
         cleaned_email = profile_data.email.strip().lower()
         existing_email = (
@@ -339,7 +326,6 @@ def update_user_profile(
             raise HTTPException(status_code=400, detail="Email already in use")
         current_user.email = cleaned_email
 
-    # names — allowed for everyone
     if profile_data.first_name is not None:
         current_user.first_name = profile_data.first_name
     if profile_data.last_name is not None:
@@ -347,7 +333,6 @@ def update_user_profile(
     if profile_data.middle_initial is not None:
         current_user.middle_initial = profile_data.middle_initial
 
-    # program / year_level — STUDENTS ONLY (already guaranteed not-admin past the block above)
     if not is_admin:
         if profile_data.program is not None:
             program = (
@@ -399,7 +384,6 @@ async def upload_profile_picture(
             detail=f"File too large. Maximum size: {MAX_FILE_SIZE / (1024*1024)}MB",
         )
 
-    # Delete old Cloudinary image if it exists
     if current_user.profile_image and "cloudinary.com" in current_user.profile_image:
         try:
             url_path = current_user.profile_image.split("/upload/")[-1]
@@ -409,7 +393,6 @@ async def upload_profile_picture(
         except Exception:
             pass
 
-    # Upload to Cloudinary
     result = cloudinary.uploader.upload(
         content,
         folder="profile_pictures",
