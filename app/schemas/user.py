@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from typing import Optional
 from datetime import datetime
 from app.models.user import UserRole, YearLevel
@@ -12,7 +12,7 @@ class UserCreate(BaseModel):
     middle_initial: Optional[str] = None
     program_id: Optional[int] = None
     year_level: Optional[YearLevel] = None
-    mobile_phone: str
+    email: EmailStr
     password: str
     role: UserRole = UserRole.STUDENT
 
@@ -25,7 +25,7 @@ class UserResponse(BaseModel):
     middle_initial: Optional[str]
     program: Optional[str] = None
     year_level: Optional[YearLevel]
-    mobile_phone: str
+    email: Optional[str] = None
     profile_image: Optional[str]
     role: str
     fingerprint_status: Optional[str] = None
@@ -54,7 +54,7 @@ class UserProfileUpdate(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     middle_initial: Optional[str] = None
-    mobile_phone: Optional[str] = None
+    email: Optional[EmailStr] = None
     program: Optional[str] = None
     year_level: Optional[str] = None
     profile_image: Optional[str] = None

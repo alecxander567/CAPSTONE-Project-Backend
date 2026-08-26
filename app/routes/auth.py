@@ -23,6 +23,7 @@ from app.core.security import blacklist_token
 from app.models.token_blacklist import TokenBlacklist
 import cloudinary
 import cloudinary.uploader
+import resend
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -41,6 +42,40 @@ cloudinary.config(
     api_secret=os.environ["CLOUDINARY_API_SECRET"],
     secure=True,
 )
+
+# ------------------- RESEND (EMAIL) CONFIG -------------------
+resend.api_key = os.environ["RESEND_API_KEY"]
+
+# Falls back to your deployed frontend if FRONTEND_URL isn't set in the env.
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://ara-system-app.vercel.app")
+
+
+def send_reset_email(to_email: str, reset_link: str):
+    """
+    Sends the password reset link via Resend.
+
+    NOTE: Resend's shared "onboarding@resend.dev" sender only delivers to the
+    email address you signed up to Resend with (sandbox mode). To send to
+    ANY user's real email in production, you need to verify your own domain
+    in the Resend dashboard and send from an address on that domain
+    (e.g. no-reply@yourdomain.com). Until then, this will silently fail or
+    bounce for real users.
+    """
+    resend.Emails.send(
+        {
+            "from": os.environ.get("RESEND_FROM_EMAIL", "onboarding@resend.dev"),
+            "to": [to_email],
+            "subject": "Reset your password",
+            "html": f"""
+                <p>We received a request to reset your password.</p>
+                <p>
+                    <a href="{reset_link}">Click here to reset your password</a>
+                </p>
+                <p>This link expires in 15 minutes. If you didn't request this,
+                you can safely ignore this email.</p>
+            """,
+        }
+    )
 
 
 # ------------------- REGISTER -------------------
@@ -68,12 +103,10 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
                 detail="First registered account must be an administrator.",
             )
 
-    # MOBILE CHECK
-    existing_mobile = (
-        db.query(User).filter(User.mobile_phone == user.mobile_phone).first()
-    )
-    if existing_mobile:
-        raise HTTPException(status_code=400, detail="Mobile phone already registered")
+    # EMAIL CHECK
+    existing_email = db.query(User).filter(User.email == user.email).first()
+    if existing_email:
+        raise HTTPException(status_code=400, detail="Email already registered")
 
     if user.student_id_no:
         existing_student = (
@@ -114,7 +147,7 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
         middle_initial=user.middle_initial,
         program_id=program_id,
         year_level=year_level,
-        mobile_phone=user.mobile_phone,
+        email=user.email,
         password=hash_password(user.password),
         role=user.role,
     )
@@ -175,26 +208,16 @@ def logout(
 # ------------------- FORGOT PASSWORD -------------------
 @router.post("/forgot-password")
 def forgot_password(data: ForgotPasswordSchema, db: Session = Depends(get_db)):
-    # Normalize the phone number (remove spaces, dashes, special chars)
-    normalized_phone = data.mobile_phone.strip().replace(" ", "").replace("-", "")
+    user = db.query(User).filter(User.email == data.email.strip().lower()).first()
 
-    # Try multiple formats if needed
-    user = db.query(User).filter(User.mobile_phone == normalized_phone).first()
-
-    # If not found, try with original format
-    if not user:
-        user = (
-            db.query(User)
-            .filter(User.mobile_phone == data.mobile_phone.strip())
-            .first()
-        )
+    # Always return the same generic response whether or not the email
+    # exists — prevents leaking which emails are registered.
+    generic_response = {
+        "message": "If that email is registered, a reset link has been sent."
+    }
 
     if not user:
-        # For debugging - check if user exists with any phone format
-        all_users = db.query(User).all()
-        print(f"Looking for phone: {normalized_phone}")
-        print(f"Available phones: {[u.mobile_phone for u in all_users]}")
-        raise HTTPException(status_code=404, detail="Phone number not found")
+        return generic_response
 
     token = secrets.token_urlsafe(32)
     expires = datetime.utcnow() + timedelta(minutes=15)
@@ -206,9 +229,16 @@ def forgot_password(data: ForgotPasswordSchema, db: Session = Depends(get_db)):
     db.add(reset)
     db.commit()
 
-    # For development, return the token in response
-    # In production, you'd send this via SMS/email
-    return {"message": "Reset link sent", "token": token}
+    reset_link = f"{FRONTEND_URL}/reset-password?token={token}"
+
+    try:
+        send_reset_email(user.email, reset_link)
+    except Exception as e:
+        # Don't leak email-provider errors to the client — log and still
+        # return the generic response so behavior stays consistent.
+        print(f"Failed to send reset email: {e}")
+
+    return generic_response
 
 
 # ------------------- RESET PASSWORD -------------------
@@ -297,19 +327,17 @@ def update_user_profile(
             raise HTTPException(status_code=400, detail="Student ID already registered")
         current_user.student_id_no = profile_data.student_id_no
 
-    # mobile phone — allowed for everyone
-    if profile_data.mobile_phone is not None:
-        cleaned_phone = (
-            profile_data.mobile_phone.strip().replace(" ", "").replace("-", "")
-        )
-        existing_mobile = (
+    # email — allowed for everyone
+    if profile_data.email is not None:
+        cleaned_email = profile_data.email.strip().lower()
+        existing_email = (
             db.query(User)
-            .filter(User.mobile_phone == cleaned_phone, User.id != current_user.id)
+            .filter(User.email == cleaned_email, User.id != current_user.id)
             .first()
         )
-        if existing_mobile:
-            raise HTTPException(status_code=400, detail="Mobile phone already in use")
-        current_user.mobile_phone = cleaned_phone
+        if existing_email:
+            raise HTTPException(status_code=400, detail="Email already in use")
+        current_user.email = cleaned_email
 
     # names — allowed for everyone
     if profile_data.first_name is not None:

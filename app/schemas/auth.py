@@ -1,8 +1,8 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 
 
 class ForgotPasswordSchema(BaseModel):
-    mobile_phone: str = Field(..., example="09123456789")
+    email: EmailStr = Field(..., example="student@example.com")
 
 
 class ResetPasswordSchema(BaseModel):

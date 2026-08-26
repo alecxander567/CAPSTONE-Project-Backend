@@ -57,7 +57,16 @@ class User(Base):
 
     year_level = Column(Enum(YearLevel, native_enum=False), nullable=True)
 
-    mobile_phone = Column(String(20), unique=True, index=True, nullable=False)
+    # Email is now the primary contact field, used for password reset.
+    # Nullable for now so existing users aren't broken by this migration —
+    # they can add it later from their profile. New registrations should
+    # require it at the API/schema validation layer.
+    email = Column(String(255), unique=True, index=True, nullable=True)
+
+    # No longer required — kept for backward compatibility with existing
+    # user records. Safe to drop later once nothing reads it anymore.
+    mobile_phone = Column(String(20), unique=True, index=True, nullable=True)
+
     device_token = Column(String(255), nullable=True)
     profile_image = Column(String(255), nullable=True)
     password = Column(String(255), nullable=False)
