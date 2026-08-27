@@ -1,4 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.core.database import get_db
@@ -20,20 +27,19 @@ from app.utils.device import (
     DEFAULT_DEVICE_ID,
 )
 import pytz
+import asyncio
+from typing import Dict
+import time
 
 router = APIRouter(prefix="/fingerprints", tags=["Fingerprints"])
 
 ph_tz = pytz.timezone("Asia/Manila")
 
-# How long a pending_delete can stay unresolved before we consider it stale
-# and allow the finger_id to be recycled. 5 minutes is generous for any
-# realistic ESP32 round-trip.
 PENDING_DELETE_TIMEOUT_SECONDS = 300
 
-# OPTIMIZATION: Cache for device states to reduce DB queries
 _device_state_cache = {}
 _device_state_cache_time = {}
-CACHE_TTL_SECONDS = 1  # Cache for 1 second max
+CACHE_TTL_SECONDS = 1
 
 
 class EnrollmentRequest(BaseModel):
@@ -50,19 +56,11 @@ def log_request(endpoint: str, client_ip: str, extra: str = ""):
 
 
 def _finger_ids_in_flight(db: Session) -> set[int]:
-    """
-    finger_ids that some device still has an outstanding pending_delete for.
-    These must NOT be handed out to a new enrollee, even if the owning
-    user's row has already been cleared — otherwise a late delete
-    confirmation from a slow/offline device can land on the new owner.
-    """
     now = datetime.utcnow()
     stale_cutoff = now - timedelta(seconds=PENDING_DELETE_TIMEOUT_SECONDS)
     in_flight = set()
     for s in get_all_device_states(db):
         if s.pending_delete_id is not None:
-            # If the pending_delete has been sitting unresolved for too long,
-            # treat it as stale and allow the finger_id to be recycled.
             if (
                 s.pending_delete_updated_at
                 and s.pending_delete_updated_at < stale_cutoff
@@ -72,7 +70,79 @@ def _finger_ids_in_flight(db: Session) -> set[int]:
     return in_flight
 
 
-# ------------------- START ENROLLMENT -------------------
+# ==================== WEBSOCKET MANAGER ====================
+class DeviceConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+        self.device_modes: Dict[str, str] = {}
+
+    async def connect(self, websocket: WebSocket, device_id: str):
+        await websocket.accept()
+        self.active_connections[device_id] = websocket
+        print(f"[WS] Device {device_id} connected")
+
+        db = next(get_db())
+        try:
+            state = get_device_state(db, device_id)
+            await websocket.send_text(f"mode:{state.mode}")
+            self.device_modes[device_id] = state.mode
+        except:
+            pass
+
+    def disconnect(self, device_id: str):
+        self.active_connections.pop(device_id, None)
+        self.device_modes.pop(device_id, None)
+        print(f"[WS] Device {device_id} disconnected")
+
+    async def send_mode_update(self, device_id: str, mode: str):
+        if device_id in self.active_connections:
+            try:
+                await self.active_connections[device_id].send_text(f"mode:{mode}")
+                self.device_modes[device_id] = mode
+                print(f"[WS] Sent mode '{mode}' to device {device_id}")
+                return True
+            except Exception as e:
+                print(f"[WS] Error sending to {device_id}: {e}")
+                self.disconnect(device_id)
+        return False
+
+    async def broadcast_mode(self, mode: str):
+        for device_id, websocket in self.active_connections.items():
+            try:
+                await websocket.send_text(f"mode:{mode}")
+                self.device_modes[device_id] = mode
+                print(f"[WS] Sent mode '{mode}' to device {device_id}")
+            except Exception as e:
+                print(f"[WS] Error broadcasting to {device_id}: {e}")
+                self.disconnect(device_id)
+
+
+ws_manager = DeviceConnectionManager()
+
+
+# ==================== WEBSOCKET ENDPOINT ====================
+@router.websocket("/ws/{device_id}")
+async def websocket_endpoint(websocket: WebSocket, device_id: str):
+    await ws_manager.connect(websocket, device_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+
+            if data == "ping":
+                await websocket.send_text("pong")
+            elif data.startswith("mode:"):
+                mode = data.split(":")[1]
+                ws_manager.device_modes[device_id] = mode
+                print(f"[WS] Device {device_id} reported mode: {mode}")
+
+    except WebSocketDisconnect:
+        ws_manager.disconnect(device_id)
+    except Exception as e:
+        print(f"[WS] Error with {device_id}: {e}")
+        ws_manager.disconnect(device_id)
+
+
+# ==================== START ENROLLMENT (WITH WEBSOCKET) ====================
 @router.post("/start-enrollment")
 def start_enrollment(
     request: EnrollmentRequest,
@@ -88,18 +158,12 @@ def start_enrollment(
 
     ensure_all_devices_free(db, "enroll")
 
-    # Reset previous enrollment state
     if user.status != FingerprintStatus.NOT_ENROLLED:
         user.finger_id = None
         user.enroll_status = EnrollmentStep.NOT_ENROLLED
         user.status = FingerprintStatus.NOT_ENROLLED
 
-    # Generate new finger_id
     existing_ids = {u.finger_id for u in db.query(User.finger_id).all() if u.finger_id}
-
-    # Don't reuse a finger_id that some device still has a pending
-    # delete for — it may still be "in flight" from a slow/offline device
-    # even though the previous owner's row has already been cleared.
     existing_ids |= _finger_ids_in_flight(db)
 
     if len(existing_ids) > 1000:
@@ -109,12 +173,10 @@ def start_enrollment(
     while finger_id in existing_ids:
         finger_id = random.randint(1, 1000)
 
-    # Set user fields
     user.finger_id = finger_id
     user.enroll_status = EnrollmentStep.PENDING
     user.status = FingerprintStatus.PENDING
 
-    # Set device mode BEFORE commit so both happen atomically
     set_mode_on_all_devices(db, "enroll")
 
     try:
@@ -124,6 +186,9 @@ def start_enrollment(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+    # Send WebSocket notification
+    asyncio.create_task(ws_manager.broadcast_mode("enroll"))
+
     return {
         "message": "Enrollment started",
         "finger_id": finger_id,
@@ -132,11 +197,10 @@ def start_enrollment(
     }
 
 
-# ------------------- ESP32 POLLS FOR PENDING ENROLLMENT -------------------
-# OPTIMIZATION: Cache the result to reduce DB queries
+# ==================== CHECK ENROLLMENT ====================
 _last_check_enrollment_result = None
 _last_check_enrollment_time = 0
-_CHECK_ENROLLMENT_CACHE_MS = 100  # Cache for 100ms to prevent thundering herd
+_CHECK_ENROLLMENT_CACHE_MS = 100
 
 
 @router.get("/check-enrollment")
@@ -149,34 +213,23 @@ def check_enrollment(
 
     client_ip = req.client.host
 
-    # OPTIMIZATION: Simple cache to prevent duplicate DB queries
-    # from multiple devices polling simultaneously
     import time
 
-    current_time = time.time() * 1000  # milliseconds
+    current_time = time.time() * 1000
     if (current_time - _last_check_enrollment_time) < _CHECK_ENROLLMENT_CACHE_MS:
-        # Return cached result for this device if it's still valid
         if _last_check_enrollment_result:
-            log_request(
-                "CHECK-ENROLLMENT-CACHED",
-                client_ip,
-                f"| Returning cached finger_id={_last_check_enrollment_result} for device={device_id}",
-            )
             return PlainTextResponse(str(_last_check_enrollment_result))
 
-    # First check PENDING users that haven't been claimed by any device yet
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
         .filter(User.enroll_status == EnrollmentStep.PENDING)
-        .filter(User.claimed_by_device.is_(None))  # not yet claimed
+        .filter(User.claimed_by_device.is_(None))
         .order_by(User.id.asc())
         .first()
     )
 
     if user:
-        # Atomically claim this user for this device so no other device
-        # picks up the same finger_id
         user.claimed_by_device = device_id
         try:
             db.commit()
@@ -195,7 +248,6 @@ def check_enrollment(
         _last_check_enrollment_time = current_time
         return PlainTextResponse(str(user.finger_id))
 
-    # Check users in other enrollment steps (resume) — these are already claimed
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
@@ -208,9 +260,7 @@ def check_enrollment(
                 ]
             )
         )
-        .filter(
-            User.claimed_by_device == device_id
-        )  # only resume if claimed by THIS device
+        .filter(User.claimed_by_device == device_id)
         .order_by(User.id.asc())
         .first()
     )
@@ -225,7 +275,6 @@ def check_enrollment(
         _last_check_enrollment_time = current_time
         return PlainTextResponse(str(user.finger_id))
 
-    # SELF-HEAL: this device is in "enroll" mode but there is no pending work
     state = get_device_state(db, device_id)
     if state.mode == "enroll":
         log_request(
@@ -235,13 +284,14 @@ def check_enrollment(
         )
         state.mode = "idle"
         db.commit()
+        asyncio.create_task(ws_manager.send_mode_update(device_id, "idle"))
 
     _last_check_enrollment_result = None
     _last_check_enrollment_time = current_time
     return PlainTextResponse("none")
 
 
-# ------------------- ESP32 UPDATES STEPS -------------------
+# ==================== UPDATE ENROLLMENT ====================
 @router.get("/update-enrollment")
 def update_enrollment(
     req: Request,
@@ -260,7 +310,6 @@ def update_enrollment(
     if not user:
         return PlainTextResponse("error")
 
-    # Guard against stale/late messages from a device.
     if status in ("place_finger", "remove_finger", "place_again", "success", "error"):
         if user.status != FingerprintStatus.PENDING:
             log_request(
@@ -287,8 +336,6 @@ def update_enrollment(
     enroll_step, fingerprint_status = status_map[status]
 
     if status == "delete_success":
-        # Only apply this if some device actually has a pending
-        # delete recorded AGAINST THIS USER.
         matching_state = (
             db.query(DeviceState)
             .filter_by(pending_delete_id=id, pending_delete_user_id=user.id)
@@ -302,8 +349,6 @@ def update_enrollment(
                 f"| finger_id={id} | IGNORED stale delete_success "
                 f"(no matching pending_delete for user_id={user.id})",
             )
-            # Clean up any dangling pending_delete_id pointing at this
-            # finger_id so it doesn't keep firing.
             for s in get_all_device_states(db):
                 if s.pending_delete_id == id:
                     s.pending_delete_id = None
@@ -317,14 +362,11 @@ def update_enrollment(
         user.finger_id = None
         user.claimed_by_device = None
 
-        # Clear the pending delete ONLY on the device that confirmed it
         matching_state.pending_delete_id = None
         matching_state.pending_delete_user_id = None
         matching_state.pending_delete_updated_at = None
 
     elif status == "delete_error":
-        # Clear the pending delete so the device doesn't keep retrying
-        # and the finger_id can be reused
         for s in get_all_device_states(db):
             if s.pending_delete_id == id:
                 s.pending_delete_id = None
@@ -333,14 +375,12 @@ def update_enrollment(
         log_request(
             "UPDATE-ENROLLMENT",
             client_ip,
-            f"| finger_id={id} | delete_error — cleared pending_delete",
+            f"| finger_id={id} | delete_error cleared pending_delete",
         )
     else:
         user.enroll_status = enroll_step
         user.status = fingerprint_status
 
-        # On success or error, clear the claimed_by_device so the user
-        # can be re-enrolled later
         if status in ("success", "error"):
             user.claimed_by_device = None
 
@@ -352,12 +392,12 @@ def update_enrollment(
 
     if status in ["success", "error", "delete_success", "delete_error"]:
         set_mode_on_all_devices(db, "idle")
+        asyncio.create_task(ws_manager.broadcast_mode("idle"))
 
     return PlainTextResponse("updated")
 
 
-# ------------------- FRONTEND POLLS FOR STATUS -------------------
-# OPTIMIZATION: Reduce logging frequency
+# ==================== GET STATUS ====================
 _get_status_call_count = 0
 
 
@@ -370,10 +410,8 @@ def get_status(
     global _get_status_call_count
 
     client_ip = req.client.host
-
     _get_status_call_count += 1
 
-    # OPTIMIZATION: Only log 5% of requests instead of 10%
     if _get_status_call_count % 20 == 1:
         log_request("GET-STATUS", client_ip, f"| finger_id={finger_id}")
 
@@ -390,7 +428,7 @@ def get_status(
     }
 
 
-# ------------------- RESET ENROLLMENT -------------------
+# ==================== RESET ENROLLMENT ====================
 @router.post("/reset-enrollment/{user_id}")
 def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
     client_ip = req.client.host
@@ -400,9 +438,6 @@ def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Also clear any pending_delete entries on devices that reference
-    # this user, so a stray reset can't be followed by a stale delete
-    # confirmation later.
     for s in get_all_device_states(db):
         if s.pending_delete_user_id == user.id:
             s.pending_delete_id = None
@@ -414,11 +449,8 @@ def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
     user.status = FingerprintStatus.NOT_ENROLLED
     user.claimed_by_device = None
 
-    # A reset is effectively a cancel of enrollment, so return every device
-    # to idle too. Otherwise the device stays stuck in "enroll" mode forever
-    # (see cancel_operation below) and ensure_all_devices_free blocks every
-    # subsequent operation with a 409.
     set_mode_on_all_devices(db, "idle")
+    asyncio.create_task(ws_manager.broadcast_mode("idle"))
 
     try:
         db.commit()
@@ -429,22 +461,11 @@ def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
     return {"message": "Enrollment reset successfully"}
 
 
-# ------------------- CANCEL / DISREGARD ANY ONGOING OPERATION -------------------
+# ==================== CANCEL OPERATION ====================
 @router.post("/cancel-operation")
 def cancel_operation(db: Session = Depends(get_db)):
-    """
-    Abort/disregard any in-progress exclusive operation (enroll / delete /
-    recognize / attendance) and return every device to idle.
-
-    This is what the dashboard's Cancel button calls. Without it, a device
-    stays stuck in the started mode ('enroll' / 'delete' / 'recognize') for
-    as long as the only other ways back to idle are the device completing the
-    op (update-enrollment / recognition-result) or a stale timeout — which
-    leaves ensure_all_devices_free blocking every later operation with a 409.
-    """
     log_request("CANCEL-OPERATION", "dashboard")
 
-    # Return all devices to idle and clear ALL residual per-device op state.
     for d in get_all_device_states(db):
         d.mode = "idle"
         d.pending_delete_id = None
@@ -455,8 +476,6 @@ def cancel_operation(db: Session = Depends(get_db)):
         d.recognition_matched = None
         d.active_event_id = None
 
-    # Roll back any user left mid-enrollment by the cancelled operation so they
-    # don't stay PENDING forever (device would keep being told to resume them).
     pending_users = (
         db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
     )
@@ -472,10 +491,12 @@ def cancel_operation(db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+
     return {"message": "All devices reset to idle; operation cancelled"}
 
 
-# ------------------- UNENROLL FINGERPRINT -------------------
+# ==================== UNENROLL FINGERPRINT ====================
 @router.post("/unenroll-fingerprint/{user_id}")
 def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_db)):
     client_ip = req.client.host
@@ -489,7 +510,6 @@ def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_d
     if not user.finger_id:
         raise HTTPException(status_code=400, detail="User has no finger_id")
 
-    # At least one device must be online to accept a delete request
     if not any(is_device_online(s) for s in get_all_device_states(db)):
         raise HTTPException(
             status_code=400,
@@ -512,11 +532,12 @@ def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_d
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+    asyncio.create_task(ws_manager.broadcast_mode("delete"))
+
     return {"message": "Unenrollment started", "finger_id": user.finger_id}
 
 
-# ------------------- DEVICE CHECK DELETE -------------------
-# OPTIMIZATION: Cache for check-delete
+# ==================== DEVICE CHECK DELETE ====================
 _last_check_delete_result = None
 _last_check_delete_time = 0
 _CHECK_DELETE_CACHE_MS = 100
@@ -532,7 +553,6 @@ def check_delete(
 
     client_ip = req.client.host
 
-    # OPTIMIZATION: Cache to prevent duplicate DB queries
     import time
 
     current_time = time.time() * 1000
@@ -543,14 +563,12 @@ def check_delete(
     state = get_device_state(db, device_id)
 
     if state.pending_delete_id is not None:
-        # Check if this pending_delete has gone stale (device never confirmed)
         now = datetime.utcnow()
         stale_cutoff = now - timedelta(seconds=PENDING_DELETE_TIMEOUT_SECONDS)
         if (
             state.pending_delete_updated_at
             and state.pending_delete_updated_at < stale_cutoff
         ):
-            # Auto-clear stale pending deletes
             log_request(
                 "CHECK-DELETE",
                 client_ip,
@@ -561,6 +579,7 @@ def check_delete(
             state.pending_delete_updated_at = None
             state.mode = "idle"
             db.commit()
+            asyncio.create_task(ws_manager.send_mode_update(device_id, "idle"))
             _last_check_delete_result = None
             _last_check_delete_time = current_time
             return PlainTextResponse("none")
@@ -576,7 +595,6 @@ def check_delete(
         _last_check_delete_time = current_time
         return PlainTextResponse(str(finger_id))
 
-    # SELF-HEAL: this device is in "delete" mode but the pending_delete was cleared
     if state.mode == "delete":
         log_request(
             "CHECK-DELETE",
@@ -585,20 +603,21 @@ def check_delete(
         )
         state.mode = "idle"
         db.commit()
+        asyncio.create_task(ws_manager.send_mode_update(device_id, "idle"))
 
     _last_check_delete_result = None
     _last_check_delete_time = current_time
     return PlainTextResponse("none")
 
 
-# ------------------- DEVICE STATUS (any device online) -------------------
+# ==================== DEVICE STATUS ====================
 @router.get("/device-status")
 def device_status(db: Session = Depends(get_db)):
     connected = any(is_device_online(s) for s in get_all_device_states(db))
     return {"connected": connected}
 
 
-# ------------------- START/STOP ATTENDANCE -------------------
+# ==================== START/STOP ATTENDANCE ====================
 @router.post("/start-attendance")
 def start_attendance(
     request: StartAttendanceRequest,
@@ -611,6 +630,9 @@ def start_attendance(
     ensure_all_devices_free(db, "attendance")
     set_mode_on_all_devices(db, "attendance")
     set_active_event_on_all_devices(db, request.event_id)
+
+    asyncio.create_task(ws_manager.broadcast_mode("attendance"))
+
     return {"message": "Attendance mode started", "event_id": request.event_id}
 
 
@@ -618,10 +640,13 @@ def start_attendance(
 def stop_attendance(db: Session = Depends(get_db)):
     set_mode_on_all_devices(db, "idle")
     set_active_event_on_all_devices(db, None)
+
+    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+
     return {"message": "Attendance mode stopped"}
 
 
-# ------------------- MARK ATTENDANCE -------------------
+# ==================== MARK ATTENDANCE ====================
 @router.get("/mark-attendance")
 def mark_attendance(
     req: Request,
@@ -648,14 +673,11 @@ def mark_attendance(
     if not ongoing_event:
         return PlainTextResponse("no_active_event")
 
-    # Verify the event is actually ongoing by checking time range
     ph_tz_local = pytz.timezone("Asia/Manila")
-
-    ph_now_aware = datetime.now(ph_tz_local)  # already tz-aware, don't localize again
+    ph_now_aware = datetime.now(ph_tz_local)
 
     event_start = datetime.combine(ongoing_event.event_date, ongoing_event.start_time)
     event_end = datetime.combine(ongoing_event.event_date, ongoing_event.end_time)
-    # These ARE naive (built from combine()), so localize() is correct here
     event_start = ph_tz_local.localize(event_start)
     event_end = ph_tz_local.localize(event_end)
 
@@ -663,8 +685,7 @@ def mark_attendance(
         log_request(
             "MARK-ATTENDANCE",
             client_ip,
-            f"| device={device_id} | finger_id={finger_id} | event not in progress "
-            f"(now={ph_now_aware}, start={event_start}, end={event_end})",
+            f"| device={device_id} | finger_id={finger_id} | event not in progress",
         )
         return PlainTextResponse("event_not_active")
 
@@ -700,7 +721,7 @@ def mark_attendance(
         log_request(
             "MARK-ATTENDANCE",
             client_ip,
-            f"| device={device_id} | finger_id={finger_id} | ALREADY MARKED (unique constraint)",
+            f"| device={device_id} | finger_id={finger_id} | ALREADY MARKED",
         )
         return PlainTextResponse("already_marked")
     except Exception as e:
@@ -713,17 +734,34 @@ def mark_attendance(
         return PlainTextResponse("database_error")
 
 
-# ------------------- DEVICE MODE FOR ESP32 -------------------
+# ==================== DEVICE MODE ====================
+_mode_cache = {}
+_mode_cache_time = {}
+
+
 @router.get("/device-mode")
 def get_device_mode(
     device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
 ):
+    import time
+
+    cache_key = f"mode_{device_id}"
+
+    if cache_key in _mode_cache:
+        cached_time, cached_mode = _mode_cache[cache_key]
+        if time.time() - cached_time < 0.5:
+            return PlainTextResponse(cached_mode)
+
     state = get_device_state(db, device_id)
-    return PlainTextResponse(state.mode)
+    mode = state.mode
+
+    _mode_cache[cache_key] = (time.time(), mode)
+
+    return PlainTextResponse(mode)
 
 
-# ------------------- START RECOGNITION TEST -------------------
+# ==================== START RECOGNITION ====================
 @router.post("/start-recognition/{user_id}")
 def start_recognition(user_id: int, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
@@ -752,13 +790,15 @@ def start_recognition(user_id: int, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
+    asyncio.create_task(ws_manager.broadcast_mode("recognize"))
+
     return {
         "message": "Recognition test started",
         "target_finger_id": user.finger_id,
     }
 
 
-# ------------------- ESP32 POSTS RECOGNITION RESULT -------------------
+# ==================== RECOGNITION RESULT ====================
 @router.get("/recognition-result")
 def recognition_result(
     finger_id: int,
@@ -768,7 +808,6 @@ def recognition_result(
 ):
     state = get_device_state(db, device_id)
 
-    # ignore a scan that arrives when there's no active recognition session
     if state.recognition_target_id is None:
         return PlainTextResponse("no_active_recognition")
 
@@ -799,11 +838,12 @@ def recognition_result(
         return PlainTextResponse("error")
 
     set_mode_on_all_devices(db, "idle")
+    asyncio.create_task(ws_manager.broadcast_mode("idle"))
 
     return PlainTextResponse("ok")
 
 
-# ------------------- FRONTEND POLLS FOR RECOGNITION RESULT -------------------
+# ==================== GET RECOGNITION RESULT ====================
 @router.get("/get-recognition-result")
 def get_recognition_result(
     finger_id: int,
@@ -827,6 +867,7 @@ def get_recognition_result(
         state.recognition_updated_at = None
         state.mode = "idle"
         db.commit()
+        asyncio.create_task(ws_manager.send_mode_update(device_id, "idle"))
         return {"status": "timeout"}
 
     if state.recognition_matched is not None:
@@ -845,7 +886,7 @@ def get_recognition_result(
     return {"status": "pending"}
 
 
-# ------------------- DEBUG ALL ENROLLED -------------------
+# ==================== DEBUG ENDPOINTS ====================
 @router.get("/debug/all-enrolled")
 def debug_all_enrolled(db: Session = Depends(get_db)):
     users = db.query(User).filter(User.status == FingerprintStatus.ENROLLED).all()
@@ -862,7 +903,6 @@ def debug_all_enrolled(db: Session = Depends(get_db)):
     ]
 
 
-# ------------------- DEBUG DEVICE STATE (all devices) -------------------
 @router.get("/debug/device-state")
 def debug_device_state(db: Session = Depends(get_db)):
     db.expire_all()
@@ -900,10 +940,8 @@ def debug_device_state(db: Session = Depends(get_db)):
     }
 
 
-# ------------------- LIST STUCK/PENDING ENROLLMENTS -------------------
 @router.get("/pending-enrollments")
 def get_pending_enrollments(db: Session = Depends(get_db)):
-    """List users currently stuck in a PENDING enrollment (e.g. dropped connection mid-enroll)."""
     users = db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
     return [
         {
@@ -918,15 +956,8 @@ def get_pending_enrollments(db: Session = Depends(get_db)):
     ]
 
 
-# ------------------- BULK CLEAR STUCK ENROLLMENTS -------------------
 @router.post("/clear-pending-enrollments")
 def clear_pending_enrollments(db: Session = Depends(get_db)):
-    """
-    Bulk-clear every user stuck in PENDING back to NOT_ENROLLED, and return
-    only devices that were in "enroll" mode back to idle. Unlike
-    cancel-operation, this leaves delete/recognize/attendance state on other
-    devices untouched.
-    """
     pending_users = (
         db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
     )
@@ -950,14 +981,14 @@ def clear_pending_enrollments(db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+
     return {
         "message": f"Cleared {len(pending_users)} pending enrollment(s)",
         "cleared": len(pending_users),
     }
 
 
-# ------------------- HEALTH CHECK FOR ESP32 SPEED -------------------
 @router.get("/ping")
 def ping():
-    """Simple ping endpoint to test latency from ESP32"""
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
