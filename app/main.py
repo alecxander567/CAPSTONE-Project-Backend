@@ -26,6 +26,28 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Create tables
+    Base.metadata.create_all(bind=engine)
+
+    # Add new columns if missing
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS claimed_by_device VARCHAR(50)"
+                )
+            )
+            conn.execute(
+                text(
+                    "ALTER TABLE device_state ADD COLUMN IF NOT EXISTS pending_delete_updated_at TIMESTAMP"
+                )
+            )
+            conn.commit()
+    except Exception as e:
+        logging.warning(
+            f"Could not add new columns (expected if they already exist): {e}"
+        )
+
     notifier_task = asyncio.create_task(event_notifier_loop())
     try:
         yield
@@ -61,27 +83,6 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # Serve static files
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
-
-# ── Add new columns if missing (for existing tables) ──────────────────────
-try:
-    with engine.connect() as conn:
-        conn.execute(
-            text(
-                "ALTER TABLE users ADD COLUMN IF NOT EXISTS claimed_by_device VARCHAR(50)"
-            )
-        )
-        conn.execute(
-            text(
-                "ALTER TABLE device_state ADD COLUMN IF NOT EXISTS pending_delete_updated_at TIMESTAMP"
-            )
-        )
-        conn.commit()
-except Exception as e:
-    logging.warning(f"Could not add new columns (expected if they already exist): {e}")
-# ─────────────────────────────────────────────────────────────────────────
-
 # Include routers
 app.include_router(auth.router)
 app.include_router(counts.router)
@@ -93,7 +94,6 @@ app.include_router(device.router)
 app.include_router(health)
 
 
-# Health check endpoint
 @app.api_route("/ping", methods=["GET", "POST", "HEAD"], tags=["Health"])
 async def ping(request: Request):
     return {

@@ -18,9 +18,9 @@ def get_db_url_with_ssl(url: str) -> str:
     """Ensure SSL parameters are added for PostgreSQL connections"""
     if "postgresql" in url.lower():
         if "?" not in url:
-            url += "?ssl_mode=require"
-        elif "ssl_mode" not in url and "sslmode" not in url:
-            url += "&ssl_mode=require"
+            url += "?sslmode=require"
+        elif "sslmode" not in url:
+            url += "&sslmode=require"
     return url
 
 
@@ -29,9 +29,7 @@ DATABASE_URL = get_db_url_with_ssl(DATABASE_URL)
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_recycle=120,  # lowered from 300s — recycle connections more
-    # aggressively so they don't go stale against
-    # provider-side idle timeouts shorter than 5 min
+    pool_recycle=120,
     pool_size=5,
     max_overflow=10,
     pool_timeout=30,
