@@ -4,7 +4,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from contextlib import asynccontextmanager
 from sqlalchemy import text
-from app.core.database import engine, Base
+from app.core.database import engine, Base, get_db_context
 from app.routes import (
     auth,
     counts,
@@ -15,6 +15,7 @@ from app.routes import (
     device,
 )
 from app.core.background_task import event_notifier_loop
+from app.utils.device import heal_stale_device_modes
 from app.routes.health import router as health
 import asyncio
 import logging
@@ -24,12 +25,22 @@ logging.basicConfig(
 )
 
 
+async def device_watchdog_loop():
+    while True:
+        try:
+            with get_db_context() as db:
+                healed = heal_stale_device_modes(db)
+                if healed:
+                    logging.warning(f"Watchdog: reset {healed} stuck device(s) to idle")
+        except Exception as e:
+            logging.error(f"Watchdog error: {e}")
+        await asyncio.sleep(30)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables
     Base.metadata.create_all(bind=engine)
 
-    # Add new columns if missing
     try:
         with engine.connect() as conn:
             conn.execute(
@@ -42,6 +53,11 @@ async def lifespan(app: FastAPI):
                     "ALTER TABLE device_state ADD COLUMN IF NOT EXISTS pending_delete_updated_at TIMESTAMP"
                 )
             )
+            conn.execute(
+                text(
+                    "ALTER TABLE device_state ADD COLUMN IF NOT EXISTS mode_updated_at TIMESTAMP"
+                )
+            )
             conn.commit()
     except Exception as e:
         logging.warning(
@@ -49,14 +65,17 @@ async def lifespan(app: FastAPI):
         )
 
     notifier_task = asyncio.create_task(event_notifier_loop())
+    watchdog_task = asyncio.create_task(device_watchdog_loop())
     try:
         yield
     finally:
         notifier_task.cancel()
-        try:
-            await notifier_task
-        except asyncio.CancelledError:
-            logging.info("Notifier loop cancelled cleanly")
+        watchdog_task.cancel()
+        for t in (notifier_task, watchdog_task):
+            try:
+                await t
+            except asyncio.CancelledError:
+                logging.info("Background task cancelled cleanly")
 
 
 app = FastAPI(
@@ -76,14 +95,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Uploads directory
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Serve static files
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# Include routers
 app.include_router(auth.router)
 app.include_router(counts.router)
 app.include_router(events.router)

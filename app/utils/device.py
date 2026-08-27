@@ -5,20 +5,18 @@ from sqlalchemy.orm import Session
 
 from app.models.device import DeviceState
 
-# Used when a device hits an endpoint without a device_id (e.g. old firmware
-# that hasn't been reflashed yet, or the dashboard-only debug endpoints).
 DEFAULT_DEVICE_ID = "esp32-default"
-
-DEVICE_STALE_SECONDS = 15  # a bit above HEARTBEAT_MS (10s) with margin
+DEVICE_STALE_SECONDS = 15
+MODE_STALE_SECONDS = 90
 
 
 def get_device_state(db: Session, device_id: str = DEFAULT_DEVICE_ID) -> DeviceState:
-    """Get or create the state row for one specific physical device."""
     state = db.query(DeviceState).filter(DeviceState.device_id == device_id).first()
     if not state:
         state = DeviceState(
             device_id=device_id,
             mode="idle",
+            mode_updated_at=datetime.utcnow(),
             pending_delete_id=None,
             recognition_target_id=None,
             recognition_finger_id=None,
@@ -44,24 +42,19 @@ def is_device_online(state: DeviceState) -> bool:
 
 
 def set_mode_on_all_devices(db: Session, mode: str) -> None:
-    """
-    Enroll / delete / attendance / recognize are exclusive, system-wide
-    operations — every known device should reflect the same mode, since
-    the dashboard has one Start/Stop control for the whole fleet, not
-    per-device controls.
-    """
     devices = get_all_device_states(db)
     for d in devices:
         d.mode = mode
+        d.mode_updated_at = datetime.utcnow()
     db.commit()
 
 
+def set_device_mode(db: Session, state: DeviceState, mode: str) -> None:
+    state.mode = mode
+    state.mode_updated_at = datetime.utcnow()
+
+
 def set_active_event_on_all_devices(db: Session, event_id: int | None) -> None:
-    """
-    Attendance mode is exclusive and system-wide (see set_mode_on_all_devices),
-    so every device shares the same active event — whichever event the
-    dashboard's Start Attendance button was pressed for.
-    """
     devices = get_all_device_states(db)
     for d in devices:
         d.active_event_id = event_id
@@ -77,20 +70,64 @@ MODE_LABELS = {
 
 
 def ensure_all_devices_free(db: Session, requested_mode: str) -> None:
-    """
-    Raise 409 if ANY known, non-stale device is busy running a different mode.
-    Stale (offline) devices are ignored so a dead device can't permanently
-    lock out the rest of the fleet.
-    """
     from fastapi import HTTPException
 
     for state in get_all_device_states(db):
         if state.mode == "idle" or state.mode == requested_mode:
             continue
         if not is_device_online(state):
-            continue  # stale/offline — ignore, allow override
+            continue
         current_label = MODE_LABELS.get(state.mode, state.mode)
         raise HTTPException(
             status_code=409,
             detail=f"{current_label} mode is currently ongoing on {state.device_id}. Please wait until it finishes.",
         )
+
+
+def heal_stale_device_modes(db: Session) -> int:
+    """
+    Watchdog: any device sitting in a non-idle mode longer than
+    MODE_STALE_SECONDS gets force-reset to idle, clearing any related
+    per-mode state. Runs on a timer from main.py so no mode can ever
+    get permanently stuck again.
+    """
+    from app.models.user import User, FingerprintStatus, EnrollmentStep
+
+    now = datetime.utcnow()
+    cutoff = now - timedelta(seconds=MODE_STALE_SECONDS)
+    healed = 0
+
+    for state in get_all_device_states(db):
+        if state.mode == "idle":
+            continue
+        if state.mode_updated_at and state.mode_updated_at >= cutoff:
+            continue
+
+        stuck_mode = state.mode
+        state.mode = "idle"
+        state.mode_updated_at = now
+        state.pending_delete_id = None
+        state.pending_delete_user_id = None
+        state.pending_delete_updated_at = None
+        state.recognition_target_id = None
+        state.recognition_finger_id = None
+        state.recognition_matched = None
+        state.recognition_updated_at = None
+        healed += 1
+
+        if stuck_mode == "enroll":
+            claimed_users = (
+                db.query(User)
+                .filter(User.claimed_by_device == state.device_id)
+                .filter(User.status == FingerprintStatus.PENDING)
+                .all()
+            )
+            for u in claimed_users:
+                u.finger_id = None
+                u.enroll_status = EnrollmentStep.NOT_ENROLLED
+                u.status = FingerprintStatus.NOT_ENROLLED
+                u.claimed_by_device = None
+
+    if healed:
+        db.commit()
+    return healed
