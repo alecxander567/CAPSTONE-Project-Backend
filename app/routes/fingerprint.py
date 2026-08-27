@@ -28,6 +28,7 @@ from app.utils.device import (
 )
 import pytz
 import asyncio
+import threading
 from typing import Dict
 import time
 
@@ -70,7 +71,7 @@ def _finger_ids_in_flight(db: Session) -> set[int]:
     return in_flight
 
 
-# ==================== WEBSOCKET MANAGER ====================
+# WEBSOCKET MANAGER
 class DeviceConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
@@ -120,7 +121,7 @@ class DeviceConnectionManager:
 ws_manager = DeviceConnectionManager()
 
 
-# ==================== WEBSOCKET ENDPOINT ====================
+# WEBSOCKET ENDPOINT
 @router.websocket("/ws/{device_id}")
 async def websocket_endpoint(websocket: WebSocket, device_id: str):
     await ws_manager.connect(websocket, device_id)
@@ -142,9 +143,9 @@ async def websocket_endpoint(websocket: WebSocket, device_id: str):
         ws_manager.disconnect(device_id)
 
 
-# ==================== START ENROLLMENT (WITH WEBSOCKET) ====================
+# START ENROLLMENT - FIXED with async and threading
 @router.post("/start-enrollment")
-def start_enrollment(
+async def start_enrollment(  # CHANGED TO ASYNC
     request: EnrollmentRequest,
     req: Request,
     db: Session = Depends(get_db),
@@ -186,8 +187,10 @@ def start_enrollment(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    # Send WebSocket notification
-    asyncio.create_task(ws_manager.broadcast_mode("enroll"))
+    # FIXED: Use threading instead of asyncio.create_task
+    threading.Thread(
+        target=lambda: asyncio.run(ws_manager.broadcast_mode("enroll"))
+    ).start()
 
     return {
         "message": "Enrollment started",
@@ -197,7 +200,7 @@ def start_enrollment(
     }
 
 
-# ==================== CHECK ENROLLMENT ====================
+# CHECK ENROLLMENT
 _last_check_enrollment_result = None
 _last_check_enrollment_time = 0
 _CHECK_ENROLLMENT_CACHE_MS = 100
@@ -212,8 +215,6 @@ def check_enrollment(
     global _last_check_enrollment_result, _last_check_enrollment_time
 
     client_ip = req.client.host
-
-    import time
 
     current_time = time.time() * 1000
     if (current_time - _last_check_enrollment_time) < _CHECK_ENROLLMENT_CACHE_MS:
@@ -284,14 +285,17 @@ def check_enrollment(
         )
         state.mode = "idle"
         db.commit()
-        asyncio.create_task(ws_manager.send_mode_update(device_id, "idle"))
+        # FIXED: Use threading
+        threading.Thread(
+            target=lambda: asyncio.run(ws_manager.send_mode_update(device_id, "idle"))
+        ).start()
 
     _last_check_enrollment_result = None
     _last_check_enrollment_time = current_time
     return PlainTextResponse("none")
 
 
-# ==================== UPDATE ENROLLMENT ====================
+# UPDATE ENROLLMENT
 @router.get("/update-enrollment")
 def update_enrollment(
     req: Request,
@@ -392,12 +396,14 @@ def update_enrollment(
 
     if status in ["success", "error", "delete_success", "delete_error"]:
         set_mode_on_all_devices(db, "idle")
-        asyncio.create_task(ws_manager.broadcast_mode("idle"))
+        threading.Thread(
+            target=lambda: asyncio.run(ws_manager.broadcast_mode("idle"))
+        ).start()
 
     return PlainTextResponse("updated")
 
 
-# ==================== GET STATUS ====================
+# GET STATUS
 _get_status_call_count = 0
 
 
@@ -428,9 +434,11 @@ def get_status(
     }
 
 
-# ==================== RESET ENROLLMENT ====================
+# RESET ENROLLMENT
 @router.post("/reset-enrollment/{user_id}")
-def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
+async def reset_enrollment(
+    user_id: int, req: Request, db: Session = Depends(get_db)
+):  # CHANGED TO ASYNC
     client_ip = req.client.host
     log_request("RESET-ENROLLMENT", client_ip, f"| user_id={user_id}")
 
@@ -450,7 +458,9 @@ def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
     user.claimed_by_device = None
 
     set_mode_on_all_devices(db, "idle")
-    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+    threading.Thread(
+        target=lambda: asyncio.run(ws_manager.broadcast_mode("idle"))
+    ).start()
 
     try:
         db.commit()
@@ -461,9 +471,9 @@ def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
     return {"message": "Enrollment reset successfully"}
 
 
-# ==================== CANCEL OPERATION ====================
+# CANCEL OPERATION
 @router.post("/cancel-operation")
-def cancel_operation(db: Session = Depends(get_db)):
+async def cancel_operation(db: Session = Depends(get_db)):  # CHANGED TO ASYNC
     log_request("CANCEL-OPERATION", "dashboard")
 
     for d in get_all_device_states(db):
@@ -491,14 +501,18 @@ def cancel_operation(db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+    threading.Thread(
+        target=lambda: asyncio.run(ws_manager.broadcast_mode("idle"))
+    ).start()
 
     return {"message": "All devices reset to idle; operation cancelled"}
 
 
-# ==================== UNENROLL FINGERPRINT ====================
+# UNENROLL FINGERPRINT
 @router.post("/unenroll-fingerprint/{user_id}")
-def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_db)):
+async def unenroll_fingerprint(
+    user_id: int, req: Request, db: Session = Depends(get_db)
+):  # CHANGED TO ASYNC
     client_ip = req.client.host
     log_request("UNENROLL-FINGERPRINT", client_ip, f"| user_id={user_id}")
 
@@ -532,12 +546,14 @@ def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_d
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    asyncio.create_task(ws_manager.broadcast_mode("delete"))
+    threading.Thread(
+        target=lambda: asyncio.run(ws_manager.broadcast_mode("delete"))
+    ).start()
 
     return {"message": "Unenrollment started", "finger_id": user.finger_id}
 
 
-# ==================== DEVICE CHECK DELETE ====================
+# CHECK DELETE
 _last_check_delete_result = None
 _last_check_delete_time = 0
 _CHECK_DELETE_CACHE_MS = 100
@@ -552,8 +568,6 @@ def check_delete(
     global _last_check_delete_result, _last_check_delete_time
 
     client_ip = req.client.host
-
-    import time
 
     current_time = time.time() * 1000
     if (current_time - _last_check_delete_time) < _CHECK_DELETE_CACHE_MS:
@@ -579,7 +593,11 @@ def check_delete(
             state.pending_delete_updated_at = None
             state.mode = "idle"
             db.commit()
-            asyncio.create_task(ws_manager.send_mode_update(device_id, "idle"))
+            threading.Thread(
+                target=lambda: asyncio.run(
+                    ws_manager.send_mode_update(device_id, "idle")
+                )
+            ).start()
             _last_check_delete_result = None
             _last_check_delete_time = current_time
             return PlainTextResponse("none")
@@ -603,23 +621,25 @@ def check_delete(
         )
         state.mode = "idle"
         db.commit()
-        asyncio.create_task(ws_manager.send_mode_update(device_id, "idle"))
+        threading.Thread(
+            target=lambda: asyncio.run(ws_manager.send_mode_update(device_id, "idle"))
+        ).start()
 
     _last_check_delete_result = None
     _last_check_delete_time = current_time
     return PlainTextResponse("none")
 
 
-# ==================== DEVICE STATUS ====================
+# DEVICE STATUS
 @router.get("/device-status")
 def device_status(db: Session = Depends(get_db)):
     connected = any(is_device_online(s) for s in get_all_device_states(db))
     return {"connected": connected}
 
 
-# ==================== START/STOP ATTENDANCE ====================
+# START ATTENDANCE
 @router.post("/start-attendance")
-def start_attendance(
+async def start_attendance(  # CHANGED TO ASYNC
     request: StartAttendanceRequest,
     db: Session = Depends(get_db),
 ):
@@ -631,22 +651,27 @@ def start_attendance(
     set_mode_on_all_devices(db, "attendance")
     set_active_event_on_all_devices(db, request.event_id)
 
-    asyncio.create_task(ws_manager.broadcast_mode("attendance"))
+    threading.Thread(
+        target=lambda: asyncio.run(ws_manager.broadcast_mode("attendance"))
+    ).start()
 
     return {"message": "Attendance mode started", "event_id": request.event_id}
 
 
+# STOP ATTENDANCE
 @router.post("/stop-attendance")
-def stop_attendance(db: Session = Depends(get_db)):
+async def stop_attendance(db: Session = Depends(get_db)):  # CHANGED TO ASYNC
     set_mode_on_all_devices(db, "idle")
     set_active_event_on_all_devices(db, None)
 
-    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+    threading.Thread(
+        target=lambda: asyncio.run(ws_manager.broadcast_mode("idle"))
+    ).start()
 
     return {"message": "Attendance mode stopped"}
 
 
-# ==================== MARK ATTENDANCE ====================
+# MARK ATTENDANCE
 @router.get("/mark-attendance")
 def mark_attendance(
     req: Request,
@@ -734,7 +759,7 @@ def mark_attendance(
         return PlainTextResponse("database_error")
 
 
-# ==================== DEVICE MODE ====================
+# DEVICE MODE
 _mode_cache = {}
 _mode_cache_time = {}
 
@@ -761,9 +786,11 @@ def get_device_mode(
     return PlainTextResponse(mode)
 
 
-# ==================== START RECOGNITION ====================
+# START RECOGNITION
 @router.post("/start-recognition/{user_id}")
-def start_recognition(user_id: int, db: Session = Depends(get_db)):
+async def start_recognition(
+    user_id: int, db: Session = Depends(get_db)
+):  # CHANGED TO ASYNC
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -790,7 +817,9 @@ def start_recognition(user_id: int, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-    asyncio.create_task(ws_manager.broadcast_mode("recognize"))
+    threading.Thread(
+        target=lambda: asyncio.run(ws_manager.broadcast_mode("recognize"))
+    ).start()
 
     return {
         "message": "Recognition test started",
@@ -798,7 +827,7 @@ def start_recognition(user_id: int, db: Session = Depends(get_db)):
     }
 
 
-# ==================== RECOGNITION RESULT ====================
+# RECOGNITION RESULT
 @router.get("/recognition-result")
 def recognition_result(
     finger_id: int,
@@ -838,12 +867,14 @@ def recognition_result(
         return PlainTextResponse("error")
 
     set_mode_on_all_devices(db, "idle")
-    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+    threading.Thread(
+        target=lambda: asyncio.run(ws_manager.broadcast_mode("idle"))
+    ).start()
 
     return PlainTextResponse("ok")
 
 
-# ==================== GET RECOGNITION RESULT ====================
+# GET RECOGNITION RESULT
 @router.get("/get-recognition-result")
 def get_recognition_result(
     finger_id: int,
@@ -867,7 +898,9 @@ def get_recognition_result(
         state.recognition_updated_at = None
         state.mode = "idle"
         db.commit()
-        asyncio.create_task(ws_manager.send_mode_update(device_id, "idle"))
+        threading.Thread(
+            target=lambda: asyncio.run(ws_manager.send_mode_update(device_id, "idle"))
+        ).start()
         return {"status": "timeout"}
 
     if state.recognition_matched is not None:
@@ -886,7 +919,7 @@ def get_recognition_result(
     return {"status": "pending"}
 
 
-# ==================== DEBUG ENDPOINTS ====================
+# DEBUG ENDPOINTS
 @router.get("/debug/all-enrolled")
 def debug_all_enrolled(db: Session = Depends(get_db)):
     users = db.query(User).filter(User.status == FingerprintStatus.ENROLLED).all()
@@ -957,7 +990,7 @@ def get_pending_enrollments(db: Session = Depends(get_db)):
 
 
 @router.post("/clear-pending-enrollments")
-def clear_pending_enrollments(db: Session = Depends(get_db)):
+async def clear_pending_enrollments(db: Session = Depends(get_db)):  # CHANGED TO ASYNC
     pending_users = (
         db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
     )
@@ -981,7 +1014,9 @@ def clear_pending_enrollments(db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+    threading.Thread(
+        target=lambda: asyncio.run(ws_manager.broadcast_mode("idle"))
+    ).start()
 
     return {
         "message": f"Cleared {len(pending_users)} pending enrollment(s)",
