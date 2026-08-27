@@ -684,10 +684,11 @@ def start_recognition(user_id: int, db: Session = Depends(get_db)):
     devices = get_all_device_states(db)
     for d in devices:
         d.mode = "recognize"
+        d.mode_updated_at = datetime.utcnow()  # ADDED — fixes premature watchdog reset
         d.recognition_target_id = user.finger_id
         d.recognition_finger_id = None
         d.recognition_matched = None
-        d.recognition_updated_at = datetime.utcnow()  # NEW
+        d.recognition_updated_at = datetime.utcnow()
 
     try:
         db.commit()
