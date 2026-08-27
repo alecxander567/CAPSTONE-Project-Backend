@@ -30,9 +30,9 @@ engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
     pool_recycle=120,
-    pool_size=2,  # CHANGED — was 5
-    max_overflow=1,  # CHANGED — was 10
-    pool_timeout=30,
+    pool_size=3,  # CHANGED — was 2
+    max_overflow=2,  # CHANGED — was 1
+    pool_timeout=15,  # CHANGED — was 30
     echo=False,
     connect_args=(
         {
