@@ -754,42 +754,37 @@ def get_recognition_result(
     device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
 ):
-    # NEW: self-heal a stale/stuck recognition session
     now = datetime.utcnow()
     stale_cutoff = now - timedelta(seconds=60)
 
-    for state in get_all_device_states(db):
-        if (
-            state.mode == "recognize"
-            and state.recognition_target_id is not None
-            and state.recognition_updated_at
-            and state.recognition_updated_at < stale_cutoff
-        ):
-            state.recognition_target_id = None
-            state.recognition_matched = None
-            state.recognition_finger_id = None
-            state.recognition_updated_at = None
-            state.mode = "idle"
-            db.commit()
-            return {"status": "timeout"}
+    state = get_device_state(db, device_id)  # CHANGED — only this device
 
-    # CHANGED: match on recognition_matched being set (session complete),
-    # not on recognition_finger_id == finger_id (which breaks on a
-    # legitimate wrong-finger scan)
-    for state in get_all_device_states(db):
-        if state.recognition_matched is not None:
-            matched = state.recognition_matched
-            scanned_id = state.recognition_finger_id
-            for s in get_all_device_states(db):
-                s.recognition_finger_id = None
-                s.recognition_matched = None
-                s.recognition_updated_at = None
-            db.commit()
-            return {
-                "status": "done",
-                "matched": matched,
-                "scanned_finger_id": scanned_id,
-            }
+    if (
+        state.mode == "recognize"
+        and state.recognition_target_id is not None
+        and state.recognition_updated_at
+        and state.recognition_updated_at < stale_cutoff
+    ):
+        state.recognition_target_id = None
+        state.recognition_matched = None
+        state.recognition_finger_id = None
+        state.recognition_updated_at = None
+        state.mode = "idle"
+        db.commit()
+        return {"status": "timeout"}
+
+    if state.recognition_matched is not None:
+        matched = state.recognition_matched
+        scanned_id = state.recognition_finger_id
+        state.recognition_finger_id = None
+        state.recognition_matched = None
+        state.recognition_updated_at = None
+        db.commit()
+        return {
+            "status": "done",
+            "matched": matched,
+            "scanned_finger_id": scanned_id,
+        }
 
     return {"status": "pending"}
 
