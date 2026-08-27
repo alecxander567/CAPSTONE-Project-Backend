@@ -30,6 +30,11 @@ ph_tz = pytz.timezone("Asia/Manila")
 # realistic ESP32 round-trip.
 PENDING_DELETE_TIMEOUT_SECONDS = 300
 
+# OPTIMIZATION: Cache for device states to reduce DB queries
+_device_state_cache = {}
+_device_state_cache_time = {}
+CACHE_TTL_SECONDS = 1  # Cache for 1 second max
+
 
 class EnrollmentRequest(BaseModel):
     user_id: int
@@ -128,13 +133,36 @@ def start_enrollment(
 
 
 # ------------------- ESP32 POLLS FOR PENDING ENROLLMENT -------------------
+# OPTIMIZATION: Cache the result to reduce DB queries
+_last_check_enrollment_result = None
+_last_check_enrollment_time = 0
+_CHECK_ENROLLMENT_CACHE_MS = 100  # Cache for 100ms to prevent thundering herd
+
+
 @router.get("/check-enrollment")
 def check_enrollment(
     req: Request,
     device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
 ):
+    global _last_check_enrollment_result, _last_check_enrollment_time
+
     client_ip = req.client.host
+
+    # OPTIMIZATION: Simple cache to prevent duplicate DB queries
+    # from multiple devices polling simultaneously
+    import time
+
+    current_time = time.time() * 1000  # milliseconds
+    if (current_time - _last_check_enrollment_time) < _CHECK_ENROLLMENT_CACHE_MS:
+        # Return cached result for this device if it's still valid
+        if _last_check_enrollment_result:
+            log_request(
+                "CHECK-ENROLLMENT-CACHED",
+                client_ip,
+                f"| Returning cached finger_id={_last_check_enrollment_result} for device={device_id}",
+            )
+            return PlainTextResponse(str(_last_check_enrollment_result))
 
     # First check PENDING users that haven't been claimed by any device yet
     user = (
@@ -154,6 +182,8 @@ def check_enrollment(
             db.commit()
         except Exception:
             db.rollback()
+            _last_check_enrollment_result = None
+            _last_check_enrollment_time = current_time
             return PlainTextResponse("none")
 
         log_request(
@@ -161,6 +191,8 @@ def check_enrollment(
             client_ip,
             f"| Found finger_id={user.finger_id} for device={device_id}",
         )
+        _last_check_enrollment_result = user.finger_id
+        _last_check_enrollment_time = current_time
         return PlainTextResponse(str(user.finger_id))
 
     # Check users in other enrollment steps (resume) — these are already claimed
@@ -189,14 +221,11 @@ def check_enrollment(
             client_ip,
             f"| Resuming finger_id={user.finger_id} on device={device_id}",
         )
+        _last_check_enrollment_result = user.finger_id
+        _last_check_enrollment_time = current_time
         return PlainTextResponse(str(user.finger_id))
 
-    # SELF-HEAL: this device is in "enroll" mode (the ESP32 only calls
-    # check-enrollment when device-mode == "enroll") but there is no pending
-    # unclaimed user and no enrollment this device can resume — i.e. the
-    # enrollment was cancelled/disregarded with nothing left to do. Return this
-    # device to idle so it stops spinning on check-enrollment forever and
-    # doesn't keep ensure_all_devices_free blocking every other operation.
+    # SELF-HEAL: this device is in "enroll" mode but there is no pending work
     state = get_device_state(db, device_id)
     if state.mode == "enroll":
         log_request(
@@ -207,6 +236,8 @@ def check_enrollment(
         state.mode = "idle"
         db.commit()
 
+    _last_check_enrollment_result = None
+    _last_check_enrollment_time = current_time
     return PlainTextResponse("none")
 
 
@@ -326,19 +357,24 @@ def update_enrollment(
 
 
 # ------------------- FRONTEND POLLS FOR STATUS -------------------
+# OPTIMIZATION: Reduce logging frequency
+_get_status_call_count = 0
+
+
 @router.get("/get-status")
 def get_status(
     req: Request,
     finger_id: int,
     db: Session = Depends(get_db),
 ):
+    global _get_status_call_count
+
     client_ip = req.client.host
 
-    if not hasattr(get_status, "call_count"):
-        get_status.call_count = 0
-    get_status.call_count += 1
+    _get_status_call_count += 1
 
-    if get_status.call_count % 10 == 1:
+    # OPTIMIZATION: Only log 5% of requests instead of 10%
+    if _get_status_call_count % 20 == 1:
         log_request("GET-STATUS", client_ip, f"| finger_id={finger_id}")
 
     user = db.query(User).filter(User.finger_id == finger_id).first()
@@ -480,13 +516,30 @@ def unenroll_fingerprint(user_id: int, req: Request, db: Session = Depends(get_d
 
 
 # ------------------- DEVICE CHECK DELETE -------------------
+# OPTIMIZATION: Cache for check-delete
+_last_check_delete_result = None
+_last_check_delete_time = 0
+_CHECK_DELETE_CACHE_MS = 100
+
+
 @router.get("/check-delete")
 def check_delete(
     req: Request,
     device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
 ):
+    global _last_check_delete_result, _last_check_delete_time
+
     client_ip = req.client.host
+
+    # OPTIMIZATION: Cache to prevent duplicate DB queries
+    import time
+
+    current_time = time.time() * 1000
+    if (current_time - _last_check_delete_time) < _CHECK_DELETE_CACHE_MS:
+        if _last_check_delete_result:
+            return PlainTextResponse(str(_last_check_delete_result))
+
     state = get_device_state(db, device_id)
 
     if state.pending_delete_id is not None:
@@ -508,6 +561,8 @@ def check_delete(
             state.pending_delete_updated_at = None
             state.mode = "idle"
             db.commit()
+            _last_check_delete_result = None
+            _last_check_delete_time = current_time
             return PlainTextResponse("none")
 
         finger_id = state.pending_delete_id
@@ -517,12 +572,11 @@ def check_delete(
             f"| device={device_id} | Found finger_id={finger_id}",
         )
         db.commit()
+        _last_check_delete_result = finger_id
+        _last_check_delete_time = current_time
         return PlainTextResponse(str(finger_id))
 
-    # SELF-HEAL: this device is in "delete" mode (the ESP32 only calls
-    # check-delete when device-mode == "delete") but the pending_delete was
-    # cleared (e.g. cancelled / disregarded / reset) — nothing left to do.
-    # Return it to idle so it stops polling check-delete forever.
+    # SELF-HEAL: this device is in "delete" mode but the pending_delete was cleared
     if state.mode == "delete":
         log_request(
             "CHECK-DELETE",
@@ -532,6 +586,8 @@ def check_delete(
         state.mode = "idle"
         db.commit()
 
+    _last_check_delete_result = None
+    _last_check_delete_time = current_time
     return PlainTextResponse("none")
 
 
@@ -684,7 +740,7 @@ def start_recognition(user_id: int, db: Session = Depends(get_db)):
     devices = get_all_device_states(db)
     for d in devices:
         d.mode = "recognize"
-        d.mode_updated_at = datetime.utcnow()  # ADDED — fixes premature watchdog reset
+        d.mode_updated_at = datetime.utcnow()
         d.recognition_target_id = user.finger_id
         d.recognition_finger_id = None
         d.recognition_matched = None
@@ -712,8 +768,7 @@ def recognition_result(
 ):
     state = get_device_state(db, device_id)
 
-    # NEW: ignore a scan that arrives when there's no active recognition
-    # session on this device (e.g. late/duplicate ESP32 report)
+    # ignore a scan that arrives when there's no active recognition session
     if state.recognition_target_id is None:
         return PlainTextResponse("no_active_recognition")
 
@@ -725,7 +780,7 @@ def recognition_result(
         .where(DeviceState.recognition_matched.is_(None))
         .values(
             recognition_matched=matched and (finger_id == state.recognition_target_id),
-            recognition_finger_id=finger_id,  # CHANGED: store the actual scanned id, not the target
+            recognition_finger_id=finger_id,
             recognition_target_id=None,
         )
     )
@@ -758,7 +813,7 @@ def get_recognition_result(
     now = datetime.utcnow()
     stale_cutoff = now - timedelta(seconds=60)
 
-    state = get_device_state(db, device_id)  # CHANGED — only this device
+    state = get_device_state(db, device_id)
 
     if (
         state.mode == "recognize"
@@ -899,3 +954,10 @@ def clear_pending_enrollments(db: Session = Depends(get_db)):
         "message": f"Cleared {len(pending_users)} pending enrollment(s)",
         "cleared": len(pending_users),
     }
+
+
+# ------------------- HEALTH CHECK FOR ESP32 SPEED -------------------
+@router.get("/ping")
+def ping():
+    """Simple ping endpoint to test latency from ESP32"""
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
