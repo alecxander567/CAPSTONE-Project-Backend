@@ -34,7 +34,7 @@ async def device_watchdog_loop():
                     logging.warning(f"Watchdog: reset {healed} stuck device(s) to idle")
         except Exception as e:
             logging.error(f"Watchdog error: {e}")
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
 
 
 @asynccontextmanager

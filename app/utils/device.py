@@ -7,7 +7,7 @@ from app.models.device import DeviceState
 
 DEFAULT_DEVICE_ID = "esp32-default"
 DEVICE_STALE_SECONDS = 15
-MODE_STALE_SECONDS = 10
+MODE_STALE_SECONDS = 25
 
 
 def get_device_state(db: Session, device_id: str = DEFAULT_DEVICE_ID) -> DeviceState:
