@@ -7,7 +7,7 @@ from app.models.device import DeviceState
 
 DEFAULT_DEVICE_ID = "esp32-default"
 DEVICE_STALE_SECONDS = 15
-MODE_STALE_SECONDS = 90
+MODE_STALE_SECONDS = 10
 
 
 def get_device_state(db: Session, device_id: str = DEFAULT_DEVICE_ID) -> DeviceState:
@@ -85,12 +85,6 @@ def ensure_all_devices_free(db: Session, requested_mode: str) -> None:
 
 
 def heal_stale_device_modes(db: Session) -> int:
-    """
-    Watchdog: any device sitting in a non-idle mode longer than
-    MODE_STALE_SECONDS gets force-reset to idle, clearing any related
-    per-mode state. Runs on a timer from main.py so no mode can ever
-    get permanently stuck again.
-    """
     from app.models.user import User, FingerprintStatus, EnrollmentStep
 
     now = datetime.utcnow()
