@@ -15,7 +15,7 @@ from app.routes import (
     device,
 )
 from app.core.background_task import event_notifier_loop
-from app.utils.device import heal_stale_device_modes
+from app.utils.device import heal_stale_device_modes, get_all_device_states
 from app.routes.health import router as health
 import asyncio
 import logging
@@ -26,9 +26,15 @@ logging.basicConfig(
 
 
 async def device_watchdog_loop():
+    print("[Watchdog] Started")
     while True:
         try:
             with get_db_context() as db:
+                # Log current modes before healing
+                devices = get_all_device_states(db)
+                for d in devices:
+                    print(f"[Watchdog] Device {d.device_id} mode: {d.mode}")
+
                 healed = heal_stale_device_modes(db)
                 if healed:
                     logging.warning(f"Watchdog: reset {healed} stuck device(s) to idle")

@@ -94,6 +94,15 @@ def heal_stale_device_modes(db: Session) -> int:
     for state in get_all_device_states(db):
         if state.mode == "idle":
             continue
+
+        # CRITICAL FIX: DO NOT reset devices in attendance mode
+        if state.mode == "attendance":
+            continue
+
+        # DO NOT reset devices in recognize mode
+        if state.mode == "recognize":
+            continue
+
         if state.mode_updated_at and state.mode_updated_at >= cutoff:
             continue
 
