@@ -22,7 +22,7 @@ def get_device_state(db: Session, device_id: str = DEFAULT_DEVICE_ID) -> DeviceS
             recognition_finger_id=None,
             recognition_matched=None,
             last_seen=None,
-            target_device_id=None,  # NEW
+            target_device_id=None,
         )
         db.add(state)
         db.commit()
@@ -148,7 +148,7 @@ def heal_stale_device_modes(db: Session) -> int:
         if state.mode == "idle":
             continue
 
-        # CRITICAL FIX: DO NOT reset devices in attendance mode
+        # DO NOT reset devices in attendance mode
         if state.mode == "attendance":
             continue
 
@@ -169,7 +169,7 @@ def heal_stale_device_modes(db: Session) -> int:
         state.recognition_finger_id = None
         state.recognition_matched = None
         state.recognition_updated_at = None
-        state.target_device_id = None  # NEW: Clear target device
+        state.target_device_id = None
         healed += 1
 
         if stuck_mode == "enroll":
@@ -184,7 +184,7 @@ def heal_stale_device_modes(db: Session) -> int:
                 u.enroll_status = EnrollmentStep.NOT_ENROLLED
                 u.status = FingerprintStatus.NOT_ENROLLED
                 u.claimed_by_device = None
-                u.target_device = None  # NEW: Clear target device
+                u.target_device = None
 
     if healed:
         db.commit()

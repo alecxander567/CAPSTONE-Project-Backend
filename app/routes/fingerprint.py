@@ -49,7 +49,7 @@ CACHE_TTL_SECONDS = 1
 
 class EnrollmentRequest(BaseModel):
     user_id: int
-    target_device: Optional[str] = None  # NEW: Admin can specify which device
+    target_device: Optional[str] = None
 
 
 class StartAttendanceRequest(BaseModel):
@@ -141,16 +141,6 @@ class DeviceConnectionManager:
             print(f"[WS] Device {device_id} not connected")
         return False
 
-    async def send_mode_to_target(self, mode: str, target_device: Optional[str] = None):
-        """Send mode to a specific target device, or broadcast if None"""
-        if target_device:
-            # Send to specific device only
-            await self.send_mode_update(target_device, mode)
-            print(f"[WS] Sent mode '{mode}' to target device {target_device}")
-        else:
-            # Broadcast to all devices
-            await self.broadcast_mode(mode)
-
     async def broadcast_mode(self, mode: str):
         """Send mode to ALL connected devices"""
         if not self.active_connections:
@@ -213,18 +203,18 @@ def ws_status():
     }
 
 
-# NEW: Get online devices for admin selection
+# Get online devices for admin selection
 @router.get("/online-devices")
 def get_online_devices_endpoint(db: Session = Depends(get_db)):
     """Get list of online devices for admin to select"""
-    devices = get_online_devices(db)
+    devices = get_all_device_states(db)  # Show all devices
     return {
         "online_devices": [
             {
                 "device_id": d.device_id,
                 "mode": d.mode,
                 "last_seen": d.last_seen,
-                "is_online": True,
+                "is_online": is_device_online(d),
             }
             for d in devices
         ],
@@ -232,7 +222,7 @@ def get_online_devices_endpoint(db: Session = Depends(get_db)):
     }
 
 
-# NEW: Set system-wide target device
+# Set system-wide target device
 @router.post("/set-target-device")
 async def set_target_device_endpoint(
     request: DeviceSelectionRequest, db: Session = Depends(get_db)
@@ -255,7 +245,7 @@ async def set_target_device_endpoint(
     }
 
 
-# NEW: Clear system-wide target device
+# Clear system-wide target device
 @router.post("/clear-target-device")
 async def clear_target_device_endpoint(db: Session = Depends(get_db)):
     """Clear the system-wide target device selection - fallback to any device"""
@@ -263,14 +253,13 @@ async def clear_target_device_endpoint(db: Session = Depends(get_db)):
     return {"message": "Target device cleared - will use any available device"}
 
 
-# NEW: Get current system-wide target device
+# Get current system-wide target device
 @router.get("/target-device")
 def get_target_device_endpoint(db: Session = Depends(get_db)):
     """Get the currently selected system-wide target device"""
     target_device = get_system_target_device(db)
 
     if target_device:
-        # Check if it's online
         state = get_device_state(db, target_device)
         return {
             "target_device": target_device,
@@ -281,7 +270,7 @@ def get_target_device_endpoint(db: Session = Depends(get_db)):
         return {"target_device": None, "is_set": False, "is_online": False}
 
 
-# START ENROLLMENT - UPDATED
+# START ENROLLMENT - FIXED
 @router.post("/start-enrollment")
 async def start_enrollment(
     request: EnrollmentRequest,
@@ -289,7 +278,7 @@ async def start_enrollment(
     db: Session = Depends(get_db),
 ):
     client_ip = req.client.host
-    target_device = request.target_device  # NEW: Admin specified device
+    target_device = request.target_device
 
     # If no specific target device, check system-wide target
     if not target_device:
@@ -305,7 +294,7 @@ async def start_enrollment(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Check if target device is valid
+    # Check if target device is valid and online
     if target_device:
         target_state = get_device_state(db, target_device)
         if not is_device_online(target_state):
@@ -322,12 +311,13 @@ async def start_enrollment(
                 detail=f"Target device {target_device} is busy: {e.detail}",
             )
 
-        # Only set the target device to enroll mode
+        # CRITICAL FIX: Only set the TARGET device to enroll mode
+        # DO NOT set all devices to enroll mode
         target_state.mode = "enroll"
         target_state.mode_updated_at = datetime.utcnow()
         db.commit()
     else:
-        # Broadcast to all devices (original behavior)
+        # Broadcast to all devices (original behavior - only if NO target specified)
         ensure_all_devices_free(db, "enroll")
         set_mode_on_all_devices(db, "enroll")
 
@@ -349,7 +339,7 @@ async def start_enrollment(
     user.finger_id = finger_id
     user.enroll_status = EnrollmentStep.PENDING
     user.status = FingerprintStatus.PENDING
-    user.target_device = target_device  # NEW: Store target device
+    user.target_device = target_device  # Store which device should handle this
 
     try:
         db.commit()
@@ -358,10 +348,12 @@ async def start_enrollment(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    # Send mode to target device or broadcast
+    # CRITICAL FIX: Only send mode to the selected device, NOT broadcast
     if target_device:
+        # Only send to the specific device
         ws_manager.schedule(ws_manager.send_mode_update(target_device, "enroll"))
     else:
+        # Only broadcast if no specific device was selected
         ws_manager.schedule(ws_manager.broadcast_mode("enroll"))
 
     return {
@@ -373,7 +365,7 @@ async def start_enrollment(
     }
 
 
-# CHECK ENROLLMENT - UPDATED
+# CHECK ENROLLMENT - FIXED
 _last_check_enrollment_result = None
 _last_check_enrollment_time = 0
 _CHECK_ENROLLMENT_CACHE_MS = 100
@@ -394,18 +386,24 @@ def check_enrollment(
         if _last_check_enrollment_result:
             return PlainTextResponse(str(_last_check_enrollment_result))
 
-    # NEW: Check if this device is targeted
     state = get_device_state(db, device_id)
 
-    # First, check for user specifically targeted to this device
+    # CRITICAL FIX: Only look for users that are targeted to THIS device
+    # OR users that have no target device (legacy behavior)
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
         .filter(User.enroll_status == EnrollmentStep.PENDING)
         .filter(User.claimed_by_device.is_(None))
-        .filter((User.target_device == device_id) | (User.target_device.is_(None)))
+        .filter(
+            # User is specifically targeted to this device
+            (User.target_device == device_id)
+            |
+            # OR user has no target (legacy - any device can take it)
+            (User.target_device.is_(None))
+        )
         .order_by(
-            # Prioritize targeted devices
+            # Prioritize users specifically targeted to this device
             User.target_device == device_id,  # True comes first
             User.id.asc(),
         )
@@ -413,10 +411,8 @@ def check_enrollment(
     )
 
     if user:
-        # If this user is targeted to another device but this device is checking,
-        # we should skip it
+        # Double-check: if this user has a target device, make sure it's THIS device
         if user.target_device and user.target_device != device_id:
-            # This user is meant for another device
             _last_check_enrollment_result = None
             _last_check_enrollment_time = current_time
             return PlainTextResponse("none")
@@ -493,7 +489,7 @@ def check_enrollment(
     return PlainTextResponse("none")
 
 
-# UPDATE ENROLLMENT - UPDATED
+# UPDATE ENROLLMENT
 @router.get("/update-enrollment")
 def update_enrollment(
     req: Request,
@@ -567,7 +563,7 @@ def update_enrollment(
         user.status = fingerprint_status
         user.finger_id = None
         user.claimed_by_device = None
-        user.target_device = None  # NEW: Clear target device
+        user.target_device = None  # Clear target device
 
         matching_state.pending_delete_id = None
         matching_state.pending_delete_user_id = None
@@ -590,7 +586,7 @@ def update_enrollment(
 
         if status in ("success", "error"):
             user.claimed_by_device = None
-            user.target_device = None  # NEW: Clear target device
+            user.target_device = None  # Clear target device
 
     try:
         db.commit()
@@ -656,7 +652,7 @@ async def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get
     user.enroll_status = EnrollmentStep.NOT_ENROLLED
     user.status = FingerprintStatus.NOT_ENROLLED
     user.claimed_by_device = None
-    user.target_device = None  # NEW: Clear target device
+    user.target_device = None  # Clear target device
 
     set_mode_on_all_devices(db, "idle")
     ws_manager.schedule(ws_manager.broadcast_mode("idle"))
@@ -684,7 +680,7 @@ async def cancel_operation(db: Session = Depends(get_db)):
         d.recognition_finger_id = None
         d.recognition_matched = None
         d.active_event_id = None
-        d.target_device_id = None  # NEW: Clear target device
+        d.target_device_id = None
 
     pending_users = (
         db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
@@ -694,7 +690,7 @@ async def cancel_operation(db: Session = Depends(get_db)):
         u.enroll_status = EnrollmentStep.NOT_ENROLLED
         u.status = FingerprintStatus.NOT_ENROLLED
         u.claimed_by_device = None
-        u.target_device = None  # NEW: Clear target device
+        u.target_device = None
 
     try:
         db.commit()
@@ -844,9 +840,6 @@ async def start_attendance(
     set_mode_on_all_devices(db, "attendance")
     set_active_event_on_all_devices(db, request.event_id)
 
-    print(
-        f"[WS] Broadcasting attendance mode to {len(ws_manager.active_connections)} device(s)"
-    )
     ws_manager.schedule(ws_manager.broadcast_mode("attendance"))
 
     return {"message": "Attendance mode started", "event_id": request.event_id}
@@ -860,9 +853,6 @@ async def stop_attendance(db: Session = Depends(get_db)):
     set_mode_on_all_devices(db, "idle")
     set_active_event_on_all_devices(db, None)
 
-    print(
-        f"[WS] Broadcasting idle mode to {len(ws_manager.active_connections)} device(s)"
-    )
     ws_manager.schedule(ws_manager.broadcast_mode("idle"))
 
     return {"message": "Attendance mode stopped"}
@@ -903,15 +893,6 @@ def mark_attendance(
     event_start = ph_tz_local.localize(event_start)
     event_end = ph_tz_local.localize(event_end)
 
-    # DEBUG: Print time comparison
-    print(f"[DEBUG] Event: {ongoing_event.id}")
-    print(f"[DEBUG] Now: {ph_now_aware}")
-    print(f"[DEBUG] Start: {event_start}")
-    print(f"[DEBUG] End: {event_end}")
-    print(
-        f"[DEBUG] Is Active: {ph_now_aware >= event_start and ph_now_aware <= event_end}"
-    )
-
     if ph_now_aware < event_start or ph_now_aware > event_end:
         log_request(
             "MARK-ATTENDANCE",
@@ -919,12 +900,6 @@ def mark_attendance(
             f"| device={device_id} | finger_id={finger_id} | event not in progress",
         )
         return PlainTextResponse("event_not_active")
-
-    log_request(
-        "MARK-ATTENDANCE",
-        client_ip,
-        f"| device={device_id} | finger_id={finger_id} | saving to event_id={ongoing_event.id}",
-    )
 
     if ongoing_event.program_id is not None:
         if user.program_id != ongoing_event.program_id:
@@ -1129,7 +1104,7 @@ def debug_all_enrolled(db: Session = Depends(get_db)):
             "finger_id": u.finger_id,
             "status": u.status.value,
             "enroll_status": u.enroll_status.value if u.enroll_status else None,
-            "target_device": u.target_device,  # NEW: Show target device
+            "target_device": u.target_device,
         }
         for u in users
     ]
@@ -1156,7 +1131,7 @@ def debug_device_state(db: Session = Depends(get_db)):
                 "active_event_id": s.active_event_id,
                 "last_seen": s.last_seen,
                 "online": is_device_online(s),
-                "target_device_id": s.target_device_id,  # NEW
+                "target_device_id": s.target_device_id,
             }
             for s in states
         ],
@@ -1167,7 +1142,7 @@ def debug_device_state(db: Session = Depends(get_db)):
                 "status": u.status.value,
                 "enroll_status": u.enroll_status.value if u.enroll_status else None,
                 "claimed_by_device": u.claimed_by_device,
-                "target_device": u.target_device,  # NEW
+                "target_device": u.target_device,
             }
             for u in pending_users
         ],
@@ -1185,7 +1160,7 @@ def get_pending_enrollments(db: Session = Depends(get_db)):
             "finger_id": u.finger_id,
             "enroll_status": u.enroll_status.value if u.enroll_status else None,
             "claimed_by_device": u.claimed_by_device,
-            "target_device": u.target_device,  # NEW
+            "target_device": u.target_device,
         }
         for u in users
     ]
@@ -1205,7 +1180,7 @@ async def clear_pending_enrollments(db: Session = Depends(get_db)):
         u.enroll_status = EnrollmentStep.NOT_ENROLLED
         u.status = FingerprintStatus.NOT_ENROLLED
         u.claimed_by_device = None
-        u.target_device = None  # NEW
+        u.target_device = None
 
     for d in get_all_device_states(db):
         if d.mode == "enroll":
