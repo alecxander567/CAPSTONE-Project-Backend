@@ -14,6 +14,7 @@ from app.routes import (
     attendance,
     device,
 )
+from app.routes.fingerprint import ws_manager
 from app.core.background_task import event_notifier_loop
 from app.utils.device import heal_stale_device_modes, get_all_device_states
 from app.routes.health import router as health
@@ -45,6 +46,12 @@ async def device_watchdog_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # FIXED: capture the running event loop and hand it to ws_manager so
+    # sync `def` endpoints (which FastAPI runs in a worker threadpool with
+    # NO running event loop) can still schedule WebSocket broadcasts via
+    # ws_manager.schedule(...) -> asyncio.run_coroutine_threadsafe(...).
+    ws_manager.set_loop(asyncio.get_running_loop())
+
     Base.metadata.create_all(bind=engine)
 
     try:

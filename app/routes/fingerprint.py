@@ -76,6 +76,33 @@ class DeviceConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
         self.device_modes: Dict[str, str] = {}
+        self.loop: asyncio.AbstractEventLoop | None = None
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Called once at app startup (see main.py lifespan) so sync
+        endpoints running in the threadpool have a loop to schedule onto."""
+        self.loop = loop
+
+    def schedule(self, coro) -> None:
+        """
+        Schedule a ws_manager coroutine for execution.
+
+        Async endpoints run on the main event loop, so asyncio.create_task
+        works directly. Sync `def` endpoints are run by FastAPI via
+        run_in_threadpool, which executes on a worker thread with NO
+        running event loop -- calling asyncio.create_task there raises
+        RuntimeError: no running event loop. In that case we hop back onto
+        the main loop captured at startup via run_coroutine_threadsafe.
+        """
+        try:
+            asyncio.get_running_loop()
+            asyncio.create_task(coro)
+        except RuntimeError:
+            if self.loop is not None and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(coro, self.loop)
+            else:
+                coro.close()
+                print("[WS] Dropped scheduled task: no event loop available yet")
 
     async def connect(self, websocket: WebSocket, device_id: str):
         await websocket.accept()
@@ -213,8 +240,8 @@ async def start_enrollment(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    # FIXED: Use asyncio.create_task directly (endpoint is async)
-    asyncio.create_task(ws_manager.broadcast_mode("enroll"))
+    # Use ws_manager.schedule() -- safe from both async and sync (threadpool) endpoints
+    ws_manager.schedule(ws_manager.broadcast_mode("enroll"))
 
     return {
         "message": "Enrollment started",
@@ -309,7 +336,7 @@ def check_enrollment(
         )
         state.mode = "idle"
         db.commit()
-        asyncio.create_task(ws_manager.send_mode_update(device_id, "idle"))
+        ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
 
     _last_check_enrollment_result = None
     _last_check_enrollment_time = current_time
@@ -417,7 +444,7 @@ def update_enrollment(
 
     if status in ["success", "error", "delete_success", "delete_error"]:
         set_mode_on_all_devices(db, "idle")
-        asyncio.create_task(ws_manager.broadcast_mode("idle"))
+        ws_manager.schedule(ws_manager.broadcast_mode("idle"))
 
     return PlainTextResponse("updated")
 
@@ -475,7 +502,7 @@ async def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get
     user.claimed_by_device = None
 
     set_mode_on_all_devices(db, "idle")
-    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+    ws_manager.schedule(ws_manager.broadcast_mode("idle"))
 
     try:
         db.commit()
@@ -516,7 +543,7 @@ async def cancel_operation(db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+    ws_manager.schedule(ws_manager.broadcast_mode("idle"))
 
     return {"message": "All devices reset to idle; operation cancelled"}
 
@@ -559,7 +586,7 @@ async def unenroll_fingerprint(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    asyncio.create_task(ws_manager.broadcast_mode("delete"))
+    ws_manager.schedule(ws_manager.broadcast_mode("delete"))
 
     return {"message": "Unenrollment started", "finger_id": user.finger_id}
 
@@ -604,7 +631,7 @@ def check_delete(
             state.pending_delete_updated_at = None
             state.mode = "idle"
             db.commit()
-            asyncio.create_task(ws_manager.send_mode_update(device_id, "idle"))
+            ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
             _last_check_delete_result = None
             _last_check_delete_time = current_time
             return PlainTextResponse("none")
@@ -628,7 +655,7 @@ def check_delete(
         )
         state.mode = "idle"
         db.commit()
-        asyncio.create_task(ws_manager.send_mode_update(device_id, "idle"))
+        ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
 
     _last_check_delete_result = None
     _last_check_delete_time = current_time
@@ -658,11 +685,11 @@ async def start_attendance(
     set_mode_on_all_devices(db, "attendance")
     set_active_event_on_all_devices(db, request.event_id)
 
-    # FIXED: Use asyncio.create_task directly (endpoint is async)
+    # Use ws_manager.schedule() -- safe from both async and sync (threadpool) endpoints
     print(
         f"[WS] Broadcasting attendance mode to {len(ws_manager.active_connections)} device(s)"
     )
-    asyncio.create_task(ws_manager.broadcast_mode("attendance"))
+    ws_manager.schedule(ws_manager.broadcast_mode("attendance"))
 
     return {"message": "Attendance mode started", "event_id": request.event_id}
 
@@ -678,7 +705,7 @@ async def stop_attendance(db: Session = Depends(get_db)):
     print(
         f"[WS] Broadcasting idle mode to {len(ws_manager.active_connections)} device(s)"
     )
-    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+    ws_manager.schedule(ws_manager.broadcast_mode("idle"))
 
     return {"message": "Attendance mode stopped"}
 
@@ -836,7 +863,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-    asyncio.create_task(ws_manager.broadcast_mode("recognize"))
+    ws_manager.schedule(ws_manager.broadcast_mode("recognize"))
 
     return {
         "message": "Recognition test started",
@@ -884,7 +911,7 @@ def recognition_result(
         return PlainTextResponse("error")
 
     set_mode_on_all_devices(db, "idle")
-    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+    ws_manager.schedule(ws_manager.broadcast_mode("idle"))
 
     return PlainTextResponse("ok")
 
@@ -913,7 +940,7 @@ def get_recognition_result(
         state.recognition_updated_at = None
         state.mode = "idle"
         db.commit()
-        asyncio.create_task(ws_manager.send_mode_update(device_id, "idle"))
+        ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
         return {"status": "timeout"}
 
     if state.recognition_matched is not None:
@@ -1027,7 +1054,7 @@ async def clear_pending_enrollments(db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    asyncio.create_task(ws_manager.broadcast_mode("idle"))
+    ws_manager.schedule(ws_manager.broadcast_mode("idle"))
 
     return {
         "message": f"Cleared {len(pending_users)} pending enrollment(s)",
