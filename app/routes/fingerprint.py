@@ -1051,10 +1051,8 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
     # STEP 6: Send the recognize command WITH the session id via WebSocket ONLY
-    # Do NOT broadcast - only send to the target device
     ws_manager.recognition_sessions[target_device] = session_id
 
-    # Send via WebSocket directly
     if target_device in ws_manager.active_connections:
         try:
             await ws_manager.active_connections[target_device].send_text(
@@ -1141,7 +1139,7 @@ def recognition_result(
     return PlainTextResponse("ok")
 
 
-# GET RECOGNITION RESULT - COMPLETE FIX
+# GET RECOGNITION RESULT - COMPLETE FIX WITH AUTO-CLEAR
 @router.get("/get-recognition-result")
 def get_recognition_result(
     finger_id: int,
@@ -1150,58 +1148,36 @@ def get_recognition_result(
 ):
     state = get_device_state(db, device_id)
 
-    # CRITICAL: Check if there's a valid recognition session for this device
-    current_session = ws_manager.recognition_sessions.get(device_id)
+    # CRITICAL: Check for stale results and auto-clear them
+    if state.recognition_matched is not None:
+        current_session = ws_manager.recognition_sessions.get(device_id)
 
-    # If there's no active session, return pending - don't return old results
-    if current_session is None:
-        print(
-            f"[RECOGNIZE] Device {device_id} has no active session, returning pending"
-        )
-        # Clear any stale data if device is in recognize mode but no session
-        if state.mode == "recognize":
+        # If no session OR result is older than 10 seconds -> stale
+        if current_session is None or (
+            state.recognition_updated_at
+            and datetime.utcnow() - state.recognition_updated_at > timedelta(seconds=10)
+        ):
+            print(f"[RECOGNIZE] Device {device_id} has stale result, auto-clearing...")
             state.recognition_target_id = None
-            state.recognition_matched = None
             state.recognition_finger_id = None
+            state.recognition_matched = None
             state.recognition_updated_at = None
             state.mode = "idle"
             db.commit()
-        return {"status": "pending"}
+            ws_manager.invalidate_recognition_session(device_id)
+            # Send idle to device
+            if device_id in ws_manager.active_connections:
+                try:
+                    import asyncio
 
-    # Check if the device is actually in recognize mode
-    if state.mode != "recognize":
-        return {"status": "not_in_recognition_mode"}
+                    asyncio.create_task(
+                        ws_manager.active_connections[device_id].send_text("mode:idle")
+                    )
+                except:
+                    pass
+            return {"status": "pending"}
 
-    # Check if there's a result
-    if state.recognition_matched is not None:
-        # Check if this result is stale (older than 10 seconds)
-        if state.recognition_updated_at:
-            now = datetime.utcnow()
-            if now - state.recognition_updated_at > timedelta(seconds=10):
-                # Stale result - clear it but don't return it
-                print(f"[RECOGNIZE] Device {device_id} has stale result, clearing...")
-                state.recognition_target_id = None
-                state.recognition_finger_id = None
-                state.recognition_matched = None
-                state.recognition_updated_at = None
-                state.mode = "idle"
-                db.commit()
-                ws_manager.invalidate_recognition_session(device_id)
-                # Send idle to device
-                if device_id in ws_manager.active_connections:
-                    try:
-                        import asyncio
-
-                        asyncio.create_task(
-                            ws_manager.active_connections[device_id].send_text(
-                                "mode:idle"
-                            )
-                        )
-                    except:
-                        pass
-                return {"status": "pending"}
-
-        # Valid result - return it and clear
+        # Valid result - return it
         matched = state.recognition_matched
         scanned_id = state.recognition_finger_id
         state.recognition_finger_id = None
@@ -1211,7 +1187,6 @@ def get_recognition_result(
         state.mode = "idle"
         db.commit()
         ws_manager.invalidate_recognition_session(device_id)
-        # Send idle to device
         if device_id in ws_manager.active_connections:
             try:
                 import asyncio
@@ -1226,6 +1201,15 @@ def get_recognition_result(
             "matched": matched,
             "scanned_finger_id": scanned_id,
         }
+
+    # No session -> pending
+    current_session = ws_manager.recognition_sessions.get(device_id)
+    if current_session is None:
+        return {"status": "pending"}
+
+    # Check if device is in recognize mode
+    if state.mode != "recognize":
+        return {"status": "not_in_recognition_mode"}
 
     # Check for timeout
     if (
