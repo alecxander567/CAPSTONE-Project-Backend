@@ -1117,25 +1117,9 @@ def get_recognition_result(
 
     state = get_device_state(db, device_id)
 
-    # Only check if this device is in recognition mode
-    if state.mode != "recognize":
-        return {"status": "not_in_recognition_mode"}
-
-    if (
-        state.mode == "recognize"
-        and state.recognition_target_id is not None
-        and state.recognition_updated_at
-        and state.recognition_updated_at < stale_cutoff
-    ):
-        state.recognition_target_id = None
-        state.recognition_matched = None
-        state.recognition_finger_id = None
-        state.recognition_updated_at = None
-        state.mode = "idle"
-        db.commit()
-        ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
-        return {"status": "timeout"}
-
+    # CHECK FOR A COMPLETED RESULT FIRST — before gating on mode.
+    # The ESP32 already flipped mode to "idle" when it posted the result,
+    # so checking mode first (old code) meant this branch never ran.
     if state.recognition_matched is not None:
         matched = state.recognition_matched
         scanned_id = state.recognition_finger_id
@@ -1150,6 +1134,25 @@ def get_recognition_result(
             "matched": matched,
             "scanned_finger_id": scanned_id,
         }
+
+    # Only now check if we're not (or no longer) in recognition mode
+    if state.mode != "recognize":
+        return {"status": "not_in_recognition_mode"}
+
+    # Stale/timeout check — only relevant if still waiting on a target
+    if (
+        state.recognition_target_id is not None
+        and state.recognition_updated_at
+        and state.recognition_updated_at < stale_cutoff
+    ):
+        state.recognition_target_id = None
+        state.recognition_matched = None
+        state.recognition_finger_id = None
+        state.recognition_updated_at = None
+        state.mode = "idle"
+        db.commit()
+        ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
+        return {"status": "timeout"}
 
     return {"status": "pending"}
 
