@@ -78,6 +78,11 @@ class User(Base):
     # Cleared when enrollment completes (success/error/reset).
     claimed_by_device = Column(String(50), nullable=True)
 
+    # NEW: Target device for this specific enrollment
+    # If set, only this device will process the enrollment
+    # If None, any available device can process it
+    target_device = Column(String(50), nullable=True)
+
     enroll_status = Column(
         Enum(
             EnrollmentStep,

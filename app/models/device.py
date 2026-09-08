@@ -21,3 +21,6 @@ class DeviceState(Base):
 
     last_seen = Column(DateTime, nullable=True)
     active_event_id = Column(Integer, ForeignKey("events.id"), nullable=True)
+
+    # NEW: Tracks which device is currently targeted for operations
+    target_device_id = Column(String(50), nullable=True)

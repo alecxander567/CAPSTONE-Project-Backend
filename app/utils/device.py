@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -22,6 +22,7 @@ def get_device_state(db: Session, device_id: str = DEFAULT_DEVICE_ID) -> DeviceS
             recognition_finger_id=None,
             recognition_matched=None,
             last_seen=None,
+            target_device_id=None,  # NEW
         )
         db.add(state)
         db.commit()
@@ -31,6 +32,18 @@ def get_device_state(db: Session, device_id: str = DEFAULT_DEVICE_ID) -> DeviceS
 
 def get_all_device_states(db: Session) -> List[DeviceState]:
     return db.query(DeviceState).all()
+
+
+def get_online_devices(db: Session) -> List[DeviceState]:
+    """Get all online devices"""
+    states = get_all_device_states(db)
+    return [s for s in states if is_device_online(s)]
+
+
+def get_offline_devices(db: Session) -> List[DeviceState]:
+    """Get all offline devices"""
+    states = get_all_device_states(db)
+    return [s for s in states if not is_device_online(s)]
 
 
 def is_device_online(state: DeviceState) -> bool:
@@ -61,6 +74,34 @@ def set_active_event_on_all_devices(db: Session, event_id: int | None) -> None:
     db.commit()
 
 
+def set_system_target_device(db: Session, device_id: str) -> None:
+    """Set the system-wide target device for operations"""
+    # Clear previous target devices
+    devices = get_all_device_states(db)
+    for d in devices:
+        d.target_device_id = None
+
+    # Set the new target device
+    state = get_device_state(db, device_id)
+    state.target_device_id = device_id
+    db.commit()
+
+
+def clear_system_target_device(db: Session) -> None:
+    """Clear the system-wide target device"""
+    devices = get_all_device_states(db)
+    for d in devices:
+        d.target_device_id = None
+    db.commit()
+
+
+def get_system_target_device(db: Session) -> Optional[str]:
+    """Get the system-wide target device"""
+    devices = get_all_device_states(db)
+    target_devices = [d.device_id for d in devices if d.target_device_id is not None]
+    return target_devices[0] if target_devices else None
+
+
 MODE_LABELS = {
     "enroll": "Enrollment",
     "delete": "Fingerprint deletion",
@@ -69,10 +110,22 @@ MODE_LABELS = {
 }
 
 
-def ensure_all_devices_free(db: Session, requested_mode: str) -> None:
+def ensure_all_devices_free(
+    db: Session, requested_mode: str, target_device: Optional[str] = None
+) -> None:
+    """
+    Check if devices are free for operation.
+    If target_device is specified, only check that specific device.
+    """
     from fastapi import HTTPException
 
-    for state in get_all_device_states(db):
+    devices = get_all_device_states(db)
+
+    for state in devices:
+        # If target_device is specified, only check that device
+        if target_device and state.device_id != target_device:
+            continue
+
         if state.mode == "idle" or state.mode == requested_mode:
             continue
         if not is_device_online(state):
@@ -116,6 +169,7 @@ def heal_stale_device_modes(db: Session) -> int:
         state.recognition_finger_id = None
         state.recognition_matched = None
         state.recognition_updated_at = None
+        state.target_device_id = None  # NEW: Clear target device
         healed += 1
 
         if stuck_mode == "enroll":
@@ -130,6 +184,7 @@ def heal_stale_device_modes(db: Session) -> int:
                 u.enroll_status = EnrollmentStep.NOT_ENROLLED
                 u.status = FingerprintStatus.NOT_ENROLLED
                 u.claimed_by_device = None
+                u.target_device = None  # NEW: Clear target device
 
     if healed:
         db.commit()
