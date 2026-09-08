@@ -111,7 +111,6 @@ class DeviceConnectionManager:
         try:
             state = get_device_state(db, device_id)
 
-            # Update last_seen
             state.last_seen = datetime.utcnow()
             db.commit()
 
@@ -144,7 +143,6 @@ class DeviceConnectionManager:
         return False
 
     async def broadcast_mode(self, mode: str):
-        """Send mode to ALL connected devices"""
         if not self.active_connections:
             print(f"[WS] No devices connected, cannot broadcast '{mode}'")
             return
@@ -161,7 +159,6 @@ class DeviceConnectionManager:
                 self.disconnect(device_id)
 
     async def send_recognize_command(self, device_id: str, session_id: int):
-        """Send recognize command directly to a specific device with session ID"""
         self.recognition_sessions[device_id] = session_id
         if device_id in self.active_connections:
             try:
@@ -181,8 +178,6 @@ class DeviceConnectionManager:
         return False
 
     def invalidate_recognition_session(self, device_id: str):
-        """Call whenever a device leaves recognize mode, so any late/stale
-        POST for the old session id can never be accepted again."""
         self.recognition_sessions[device_id] = None
 
 
@@ -204,7 +199,6 @@ async def websocket_endpoint(websocket: WebSocket, device_id: str):
                 ws_manager.device_modes[device_id] = mode
                 print(f"[WS] Device {device_id} reported mode: {mode}")
 
-            # Update last_seen periodically
             db = SessionLocal()
             try:
                 state = get_device_state(db, device_id)
@@ -233,7 +227,6 @@ def ws_status():
 # Get online devices for admin selection
 @router.get("/online-devices")
 def get_online_devices_endpoint(db: Session = Depends(get_db)):
-    """Get list of online devices for admin to select"""
     devices = get_all_device_states(db)
     return {
         "online_devices": [
@@ -254,15 +247,12 @@ def get_online_devices_endpoint(db: Session = Depends(get_db)):
 async def set_target_device_endpoint(
     request: DeviceSelectionRequest, db: Session = Depends(get_db)
 ):
-    """Admin sets which device should handle the next enrollment(s)"""
     device_id = request.device_id
 
-    # Verify device exists and is online
     state = get_device_state(db, device_id)
     if not is_device_online(state):
         raise HTTPException(status_code=400, detail=f"Device {device_id} is not online")
 
-    # Set system target device
     set_system_target_device(db, device_id)
 
     return {
@@ -275,7 +265,6 @@ async def set_target_device_endpoint(
 # Clear system-wide target device
 @router.post("/clear-target-device")
 async def clear_target_device_endpoint(db: Session = Depends(get_db)):
-    """Clear the system-wide target device selection - fallback to any device"""
     clear_system_target_device(db)
     return {"message": "Target device cleared - will use any available device"}
 
@@ -283,7 +272,6 @@ async def clear_target_device_endpoint(db: Session = Depends(get_db)):
 # Get current system-wide target device
 @router.get("/target-device")
 def get_target_device_endpoint(db: Session = Depends(get_db)):
-    """Get the currently selected system-wide target device"""
     target_device = get_system_target_device(db)
 
     if target_device:
@@ -297,7 +285,7 @@ def get_target_device_endpoint(db: Session = Depends(get_db)):
         return {"target_device": None, "is_set": False, "is_online": False}
 
 
-# START ENROLLMENT - FIXED
+# START ENROLLMENT
 @router.post("/start-enrollment")
 async def start_enrollment(
     request: EnrollmentRequest,
@@ -307,7 +295,6 @@ async def start_enrollment(
     client_ip = req.client.host
     target_device = request.target_device
 
-    # If no specific target device, check system-wide target
     if not target_device:
         target_device = get_system_target_device(db)
 
@@ -321,7 +308,6 @@ async def start_enrollment(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # CRITICAL FIX: Only set the TARGET device to enroll mode
     if target_device:
         target_state = get_device_state(db, target_device)
         if not is_device_online(target_state):
@@ -329,7 +315,6 @@ async def start_enrollment(
                 status_code=400, detail=f"Target device {target_device} is not online"
             )
 
-        # Check if target device is free
         try:
             ensure_all_devices_free(db, "enroll", target_device=target_device)
         except HTTPException as e:
@@ -338,21 +323,10 @@ async def start_enrollment(
                 detail=f"Target device {target_device} is busy: {e.detail}",
             )
 
-        # ONLY set the target device to enroll mode
         target_state.mode = "enroll"
         target_state.mode_updated_at = datetime.utcnow()
         db.commit()
-        
-        # Reset other devices to idle if they were in enroll mode
-        other_devices = get_all_device_states(db)
-        for d in other_devices:
-            if d.device_id != target_device and d.mode == "enroll":
-                d.mode = "idle"
-                d.mode_updated_at = datetime.utcnow()
-        db.commit()
-        
     else:
-        # No target specified - broadcast to all devices (original behavior)
         ensure_all_devices_free(db, "enroll")
         set_mode_on_all_devices(db, "enroll")
 
@@ -383,7 +357,6 @@ async def start_enrollment(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    # CRITICAL FIX: Only send mode to the selected device, NOT broadcast
     if target_device:
         ws_manager.schedule(ws_manager.send_mode_update(target_device, "enroll"))
     else:
@@ -398,7 +371,7 @@ async def start_enrollment(
     }
 
 
-# CHECK ENROLLMENT - FIXED
+# CHECK ENROLLMENT
 _last_check_enrollment_result = None
 _last_check_enrollment_time = 0
 _CHECK_ENROLLMENT_CACHE_MS = 100
@@ -421,7 +394,6 @@ def check_enrollment(
 
     state = get_device_state(db, device_id)
 
-    # CRITICAL FIX: Only look for users that are targeted to THIS device
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
@@ -456,7 +428,6 @@ def check_enrollment(
         _last_check_enrollment_time = current_time
         return PlainTextResponse(str(user.finger_id))
 
-    # Check for resuming user on this device
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
@@ -987,10 +958,9 @@ def get_device_mode(
     return PlainTextResponse(mode)
 
 
-# START RECOGNITION - COMPLETE FIX
+# START RECOGNITION
 @router.post("/start-recognition/{user_id}")
 async def start_recognition(user_id: int, db: Session = Depends(get_db)):
-    """Start recognition on the device where the fingerprint is enrolled"""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -999,7 +969,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     if not user.finger_id:
         raise HTTPException(status_code=400, detail="User has no fingerprint")
 
-    # STEP 1: Clear ANY existing recognition state from ALL devices
+    # Clear ANY existing recognition state from ALL devices
     devices = get_all_device_states(db)
     for d in devices:
         d.recognition_target_id = None
@@ -1014,7 +984,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     db.commit()
     print("[RECOGNIZE] Cleared all existing recognition state from all devices")
 
-    # STEP 2: Determine which device should handle recognition
+    # Determine which device should handle recognition
     target_device = None
 
     if user.target_device:
@@ -1040,17 +1010,14 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
                 status_code=503, detail="No online devices available for recognition"
             )
 
-    # STEP 3: Verify target device is online
     state = get_device_state(db, target_device)
     if not is_device_online(state):
         raise HTTPException(
             status_code=503, detail=f"Target device {target_device} is not online"
         )
 
-    # STEP 4: Generate session ID
     session_id = random.randint(1, 2_147_000_000)
 
-    # STEP 5: Set target device to recognize mode
     state.mode = "recognize"
     state.mode_updated_at = datetime.utcnow()
     state.recognition_target_id = user.finger_id
@@ -1067,7 +1034,6 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-    # STEP 6: Send the recognize command WITH the session id via WebSocket ONLY
     ws_manager.schedule(ws_manager.send_recognize_command(target_device, session_id))
 
     return {
@@ -1079,7 +1045,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     }
 
 
-# RECOGNITION RESULT - FIXED with session validation
+# RECOGNITION RESULT
 @router.get("/recognition-result")
 def recognition_result(
     finger_id: int,
@@ -1088,7 +1054,6 @@ def recognition_result(
     session_id: int = -1,
     db: Session = Depends(get_db),
 ):
-    # Check session ID - reject anything without valid session
     current_session = ws_manager.recognition_sessions.get(device_id)
     if current_session is None or session_id != current_session:
         print(
@@ -1141,7 +1106,7 @@ def recognition_result(
     return PlainTextResponse("ok")
 
 
-# GET RECOGNITION RESULT - COMPLETE FIX
+# GET RECOGNITION RESULT
 @router.get("/get-recognition-result")
 def get_recognition_result(
     finger_id: int,
@@ -1150,11 +1115,10 @@ def get_recognition_result(
 ):
     state = get_device_state(db, device_id)
 
-    # Check for stale results and auto-clear them
+    # Auto-clear stale results
     if state.recognition_matched is not None:
         current_session = ws_manager.recognition_sessions.get(device_id)
 
-        # If no session OR result is older than 10 seconds -> stale
         if current_session is None or (
             state.recognition_updated_at
             and datetime.utcnow() - state.recognition_updated_at > timedelta(seconds=10)
@@ -1169,7 +1133,6 @@ def get_recognition_result(
             ws_manager.invalidate_recognition_session(device_id)
             return {"status": "pending"}
 
-        # Valid result - return it
         matched = state.recognition_matched
         scanned_id = state.recognition_finger_id
         state.recognition_finger_id = None
@@ -1185,16 +1148,13 @@ def get_recognition_result(
             "scanned_finger_id": scanned_id,
         }
 
-    # No session -> pending
     current_session = ws_manager.recognition_sessions.get(device_id)
     if current_session is None:
         return {"status": "pending"}
 
-    # Check if device is in recognize mode
     if state.mode != "recognize":
         return {"status": "not_in_recognition_mode"}
 
-    # Check for timeout
     if (
         state.recognition_target_id is not None
         and state.recognition_updated_at
@@ -1212,13 +1172,12 @@ def get_recognition_result(
     return {"status": "pending"}
 
 
-# CANCEL RECOGNITION - Clear any pending recognition state
+# CANCEL RECOGNITION
 @router.post("/cancel-recognition/{user_id}")
 async def cancel_recognition(
     user_id: int,
     db: Session = Depends(get_db),
 ):
-    """Clear any pending recognition state for a user"""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1244,10 +1203,8 @@ async def cancel_recognition(
 async def clear_all_pending(
     db: Session = Depends(get_db),
 ):
-    """Clear ALL pending enrollments and recognition state from all devices"""
     log_request("CLEAR-ALL-PENDING", "dashboard")
 
-    # Clear all pending users
     pending_users = (
         db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
     )
@@ -1261,7 +1218,6 @@ async def clear_all_pending(
         u.claimed_by_device = None
         u.target_device = None
 
-    # Clear ALL device states - including recognition
     devices = get_all_device_states(db)
     for d in devices:
         d.mode = "idle"
@@ -1282,7 +1238,6 @@ async def clear_all_pending(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    # Send idle to all devices
     ws_manager.schedule(ws_manager.broadcast_mode("idle"))
 
     return {

@@ -22,5 +22,5 @@ class DeviceState(Base):
     last_seen = Column(DateTime, nullable=True)
     active_event_id = Column(Integer, ForeignKey("events.id"), nullable=True)
 
-    # NEW: System-wide target device
+    # System-wide target device
     target_device_id = Column(String(50), nullable=True)
