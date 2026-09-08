@@ -161,6 +161,7 @@ class DeviceConnectionManager:
                 self.disconnect(device_id)
 
     async def send_recognize_command(self, device_id: str, session_id: int):
+        """Send recognize command directly to a specific device"""
         self.recognition_sessions[device_id] = session_id
         if device_id in self.active_connections:
             try:
@@ -969,7 +970,7 @@ def get_device_mode(
     return PlainTextResponse(mode)
 
 
-# START RECOGNITION - FIXED
+# START RECOGNITION - COMPLETE FIX
 @router.post("/start-recognition/{user_id}")
 async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     """Start recognition on the device where the fingerprint is enrolled"""
@@ -981,7 +982,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     if not user.finger_id:
         raise HTTPException(status_code=400, detail="User has no fingerprint")
 
-    # Clear ANY existing recognition state from ALL devices first
+    # STEP 1: Clear ANY existing recognition state from ALL devices
     devices = get_all_device_states(db)
     for d in devices:
         d.recognition_target_id = None
@@ -996,7 +997,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     db.commit()
     print("[RECOGNIZE] Cleared all existing recognition state from all devices")
 
-    # Determine which device should handle recognition
+    # STEP 2: Determine which device should handle recognition
     target_device = None
 
     if user.target_device:
@@ -1022,15 +1023,17 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
                 status_code=503, detail="No online devices available for recognition"
             )
 
+    # STEP 3: Verify target device is online
     state = get_device_state(db, target_device)
     if not is_device_online(state):
         raise HTTPException(
             status_code=503, detail=f"Target device {target_device} is not online"
         )
 
-    # Generate session ID FIRST
+    # STEP 4: Generate session ID
     session_id = random.randint(1, 2_147_000_000)
 
+    # STEP 5: Set target device to recognize mode
     state.mode = "recognize"
     state.mode_updated_at = datetime.utcnow()
     state.recognition_target_id = user.finger_id
@@ -1047,8 +1050,25 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Send the recognize command WITH the session id
-    ws_manager.schedule(ws_manager.send_recognize_command(target_device, session_id))
+    # STEP 6: Send the recognize command WITH the session id via WebSocket ONLY
+    # Do NOT broadcast - only send to the target device
+    ws_manager.recognition_sessions[target_device] = session_id
+
+    # Send via WebSocket directly
+    if target_device in ws_manager.active_connections:
+        try:
+            await ws_manager.active_connections[target_device].send_text(
+                f"mode:recognize:{session_id}"
+            )
+            ws_manager.device_modes[target_device] = "recognize"
+            print(
+                f"[WS] Sent recognize (session={session_id}) to device {target_device}"
+            )
+        except Exception as e:
+            print(f"[WS] Error sending recognize to {target_device}: {e}")
+            ws_manager.disconnect(target_device)
+    else:
+        print(f"[WS] Device {target_device} not connected")
 
     return {
         "message": f"Recognition test started on device {target_device}",
@@ -1130,7 +1150,7 @@ def get_recognition_result(
 ):
     state = get_device_state(db, device_id)
 
-    # CRITICAL: Check if there's a valid recognition session
+    # CRITICAL: Check if there's a valid recognition session for this device
     current_session = ws_manager.recognition_sessions.get(device_id)
 
     # If there's no active session, return pending - don't return old results
@@ -1167,7 +1187,18 @@ def get_recognition_result(
                 state.mode = "idle"
                 db.commit()
                 ws_manager.invalidate_recognition_session(device_id)
-                ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
+                # Send idle to device
+                if device_id in ws_manager.active_connections:
+                    try:
+                        import asyncio
+
+                        asyncio.create_task(
+                            ws_manager.active_connections[device_id].send_text(
+                                "mode:idle"
+                            )
+                        )
+                    except:
+                        pass
                 return {"status": "pending"}
 
         # Valid result - return it and clear
@@ -1180,7 +1211,16 @@ def get_recognition_result(
         state.mode = "idle"
         db.commit()
         ws_manager.invalidate_recognition_session(device_id)
-        ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
+        # Send idle to device
+        if device_id in ws_manager.active_connections:
+            try:
+                import asyncio
+
+                asyncio.create_task(
+                    ws_manager.active_connections[device_id].send_text("mode:idle")
+                )
+            except:
+                pass
         return {
             "status": "done",
             "matched": matched,
@@ -1200,7 +1240,6 @@ def get_recognition_result(
         state.mode = "idle"
         db.commit()
         ws_manager.invalidate_recognition_session(device_id)
-        ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
         return {"status": "timeout"}
 
     return {"status": "pending"}
