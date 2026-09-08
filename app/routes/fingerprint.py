@@ -307,6 +307,7 @@ async def start_enrollment(
     client_ip = req.client.host
     target_device = request.target_device
 
+    # If no specific target device, check system-wide target
     if not target_device:
         target_device = get_system_target_device(db)
 
@@ -320,6 +321,7 @@ async def start_enrollment(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # CRITICAL FIX: Only set the TARGET device to enroll mode
     if target_device:
         target_state = get_device_state(db, target_device)
         if not is_device_online(target_state):
@@ -327,6 +329,7 @@ async def start_enrollment(
                 status_code=400, detail=f"Target device {target_device} is not online"
             )
 
+        # Check if target device is free
         try:
             ensure_all_devices_free(db, "enroll", target_device=target_device)
         except HTTPException as e:
@@ -335,10 +338,21 @@ async def start_enrollment(
                 detail=f"Target device {target_device} is busy: {e.detail}",
             )
 
+        # ONLY set the target device to enroll mode
         target_state.mode = "enroll"
         target_state.mode_updated_at = datetime.utcnow()
         db.commit()
+        
+        # Reset other devices to idle if they were in enroll mode
+        other_devices = get_all_device_states(db)
+        for d in other_devices:
+            if d.device_id != target_device and d.mode == "enroll":
+                d.mode = "idle"
+                d.mode_updated_at = datetime.utcnow()
+        db.commit()
+        
     else:
+        # No target specified - broadcast to all devices (original behavior)
         ensure_all_devices_free(db, "enroll")
         set_mode_on_all_devices(db, "enroll")
 
@@ -369,6 +383,7 @@ async def start_enrollment(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+    # CRITICAL FIX: Only send mode to the selected device, NOT broadcast
     if target_device:
         ws_manager.schedule(ws_manager.send_mode_update(target_device, "enroll"))
     else:
@@ -406,6 +421,7 @@ def check_enrollment(
 
     state = get_device_state(db, device_id)
 
+    # CRITICAL FIX: Only look for users that are targeted to THIS device
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
@@ -440,6 +456,7 @@ def check_enrollment(
         _last_check_enrollment_time = current_time
         return PlainTextResponse(str(user.finger_id))
 
+    # Check for resuming user on this device
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
