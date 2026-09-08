@@ -161,7 +161,7 @@ class DeviceConnectionManager:
                 self.disconnect(device_id)
 
     async def send_recognize_command(self, device_id: str, session_id: int):
-        """Send recognize command directly to a specific device"""
+        """Send recognize command directly to a specific device with session ID"""
         self.recognition_sessions[device_id] = session_id
         if device_id in self.active_connections:
             try:
@@ -1051,22 +1051,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
     # STEP 6: Send the recognize command WITH the session id via WebSocket ONLY
-    ws_manager.recognition_sessions[target_device] = session_id
-
-    if target_device in ws_manager.active_connections:
-        try:
-            await ws_manager.active_connections[target_device].send_text(
-                f"mode:recognize:{session_id}"
-            )
-            ws_manager.device_modes[target_device] = "recognize"
-            print(
-                f"[WS] Sent recognize (session={session_id}) to device {target_device}"
-            )
-        except Exception as e:
-            print(f"[WS] Error sending recognize to {target_device}: {e}")
-            ws_manager.disconnect(target_device)
-    else:
-        print(f"[WS] Device {target_device} not connected")
+    ws_manager.schedule(ws_manager.send_recognize_command(target_device, session_id))
 
     return {
         "message": f"Recognition test started on device {target_device}",
@@ -1077,7 +1062,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     }
 
 
-# RECOGNITION RESULT - FIXED
+# RECOGNITION RESULT - FIXED with session validation
 @router.get("/recognition-result")
 def recognition_result(
     finger_id: int,
@@ -1139,7 +1124,7 @@ def recognition_result(
     return PlainTextResponse("ok")
 
 
-# GET RECOGNITION RESULT - COMPLETE FIX WITH AUTO-CLEAR
+# GET RECOGNITION RESULT - COMPLETE FIX
 @router.get("/get-recognition-result")
 def get_recognition_result(
     finger_id: int,
@@ -1148,7 +1133,7 @@ def get_recognition_result(
 ):
     state = get_device_state(db, device_id)
 
-    # CRITICAL: Check for stale results and auto-clear them
+    # Check for stale results and auto-clear them
     if state.recognition_matched is not None:
         current_session = ws_manager.recognition_sessions.get(device_id)
 
@@ -1165,16 +1150,6 @@ def get_recognition_result(
             state.mode = "idle"
             db.commit()
             ws_manager.invalidate_recognition_session(device_id)
-            # Send idle to device
-            if device_id in ws_manager.active_connections:
-                try:
-                    import asyncio
-
-                    asyncio.create_task(
-                        ws_manager.active_connections[device_id].send_text("mode:idle")
-                    )
-                except:
-                    pass
             return {"status": "pending"}
 
         # Valid result - return it
@@ -1187,15 +1162,6 @@ def get_recognition_result(
         state.mode = "idle"
         db.commit()
         ws_manager.invalidate_recognition_session(device_id)
-        if device_id in ws_manager.active_connections:
-            try:
-                import asyncio
-
-                asyncio.create_task(
-                    ws_manager.active_connections[device_id].send_text("mode:idle")
-                )
-            except:
-                pass
         return {
             "status": "done",
             "matched": matched,
