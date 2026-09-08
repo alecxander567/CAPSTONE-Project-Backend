@@ -986,7 +986,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     for d in devices:
         d.recognition_target_id = None
         d.recognition_finger_id = None
-        d.recognition_matched = None  # CRITICAL: Clear false values too
+        d.recognition_matched = None
         d.recognition_updated_at = None
         if d.mode == "recognize":
             d.mode = "idle"
@@ -1028,6 +1028,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
             status_code=503, detail=f"Target device {target_device} is not online"
         )
 
+    # Generate session ID FIRST
     session_id = random.randint(1, 2_147_000_000)
 
     state.mode = "recognize"
@@ -1046,6 +1047,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
+    # Send the recognize command WITH the session id
     ws_manager.schedule(ws_manager.send_recognize_command(target_device, session_id))
 
     return {
@@ -1066,7 +1068,7 @@ def recognition_result(
     session_id: int = -1,
     db: Session = Depends(get_db),
 ):
-    # Check session ID
+    # Check session ID - reject anything without valid session
     current_session = ws_manager.recognition_sessions.get(device_id)
     if current_session is None or session_id != current_session:
         print(
@@ -1119,7 +1121,7 @@ def recognition_result(
     return PlainTextResponse("ok")
 
 
-# GET RECOGNITION RESULT - FIXED
+# GET RECOGNITION RESULT - COMPLETE FIX
 @router.get("/get-recognition-result")
 def get_recognition_result(
     finger_id: int,
@@ -1128,28 +1130,35 @@ def get_recognition_result(
 ):
     state = get_device_state(db, device_id)
 
-    # If there's a result, check if it's stale
-    if state.recognition_matched is not None:
-        # If recognition_finger_id is 0, it's a failed attempt
-        # Treat it as stale and clear it
-        if state.recognition_finger_id == 0:
-            print(
-                f"[RECOGNIZE] Device {device_id} has stale failed result (finger_id=0), clearing..."
-            )
+    # CRITICAL: Check if there's a valid recognition session
+    current_session = ws_manager.recognition_sessions.get(device_id)
+
+    # If there's no active session, return pending - don't return old results
+    if current_session is None:
+        print(
+            f"[RECOGNIZE] Device {device_id} has no active session, returning pending"
+        )
+        # Clear any stale data if device is in recognize mode but no session
+        if state.mode == "recognize":
             state.recognition_target_id = None
-            state.recognition_finger_id = None
             state.recognition_matched = None
+            state.recognition_finger_id = None
             state.recognition_updated_at = None
             state.mode = "idle"
             db.commit()
-            ws_manager.invalidate_recognition_session(device_id)
-            ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
-            return {"status": "pending"}
+        return {"status": "pending"}
 
-        # Check if the result is too old (more than 30 seconds)
+    # Check if the device is actually in recognize mode
+    if state.mode != "recognize":
+        return {"status": "not_in_recognition_mode"}
+
+    # Check if there's a result
+    if state.recognition_matched is not None:
+        # Check if this result is stale (older than 10 seconds)
         if state.recognition_updated_at:
             now = datetime.utcnow()
-            if now - state.recognition_updated_at > timedelta(seconds=30):
+            if now - state.recognition_updated_at > timedelta(seconds=10):
+                # Stale result - clear it but don't return it
                 print(f"[RECOGNIZE] Device {device_id} has stale result, clearing...")
                 state.recognition_target_id = None
                 state.recognition_finger_id = None
@@ -1161,7 +1170,7 @@ def get_recognition_result(
                 ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
                 return {"status": "pending"}
 
-        # Valid result - return it
+        # Valid result - return it and clear
         matched = state.recognition_matched
         scanned_id = state.recognition_finger_id
         state.recognition_finger_id = None
@@ -1177,10 +1186,6 @@ def get_recognition_result(
             "matched": matched,
             "scanned_finger_id": scanned_id,
         }
-
-    # If device is not in recognition mode
-    if state.mode != "recognize":
-        return {"status": "not_in_recognition_mode"}
 
     # Check for timeout
     if (
@@ -1214,10 +1219,9 @@ async def cancel_recognition(
 
     devices = get_all_device_states(db)
     for d in devices:
-        # CRITICAL: Clear ALL recognition fields, including false values
         d.recognition_target_id = None
         d.recognition_finger_id = None
-        d.recognition_matched = None  # <-- MUST clear false values too
+        d.recognition_matched = None
         d.recognition_updated_at = None
         if d.mode == "recognize":
             d.mode = "idle"
@@ -1261,7 +1265,7 @@ async def clear_all_pending(
         d.pending_delete_updated_at = None
         d.recognition_target_id = None
         d.recognition_finger_id = None
-        d.recognition_matched = None  # CRITICAL: Clear false values too
+        d.recognition_matched = None
         d.recognition_updated_at = None
         d.target_device_id = None
         ws_manager.invalidate_recognition_session(d.device_id)
