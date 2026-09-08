@@ -1045,7 +1045,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     }
 
 
-# RECOGNITION RESULT
+# RECOGNITION RESULT - FIXED
 @router.get("/recognition-result")
 def recognition_result(
     finger_id: int,
@@ -1054,13 +1054,28 @@ def recognition_result(
     session_id: int = -1,
     db: Session = Depends(get_db),
 ):
-    current_session = ws_manager.recognition_sessions.get(device_id)
-    if current_session is None or session_id != current_session:
-        print(
-            f"[RECOGNIZE] Device {device_id} posted stale/mismatched session "
-            f"(got={session_id}, expected={current_session}) — ignored"
-        )
-        return PlainTextResponse("stale_ignored")
+    # FIX: If no session_id provided, try to find an active session for this device
+    if session_id == -1:
+        current_session = ws_manager.recognition_sessions.get(device_id)
+        if current_session is not None:
+            session_id = current_session
+            print(
+                f"[RECOGNIZE] Using existing session {session_id} for device {device_id}"
+            )
+        else:
+            print(
+                f"[RECOGNIZE] Device {device_id} posted result without session_id - HTTP fallback"
+            )
+
+    # Validate session if we have one
+    if session_id != -1:
+        current_session = ws_manager.recognition_sessions.get(device_id)
+        if current_session is not None and session_id != current_session:
+            print(
+                f"[RECOGNIZE] Device {device_id} posted stale/mismatched session "
+                f"(got={session_id}, expected={current_session}) — ignored"
+            )
+            return PlainTextResponse("stale_ignored")
 
     state = get_device_state(db, device_id)
 
