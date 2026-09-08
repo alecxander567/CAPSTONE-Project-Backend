@@ -8,7 +8,7 @@ from fastapi import (
 )
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.models.user import User, FingerprintStatus, EnrollmentStep
 from fastapi.responses import PlainTextResponse
 import random
@@ -82,7 +82,11 @@ class DeviceConnectionManager:
         self.active_connections[device_id] = websocket
         print(f"[WS] Device {device_id} connected")
 
-        db = next(get_db())
+        # FIXED: create/close the session directly instead of calling
+        # next(get_db()) on the dependency generator, which never runs
+        # the generator's finally-block and permanently leaked a pooled
+        # connection on every device connect/reconnect.
+        db = SessionLocal()
         try:
             state = get_device_state(db, device_id)
             await websocket.send_text(f"mode:{state.mode}")
@@ -90,6 +94,8 @@ class DeviceConnectionManager:
             print(f"[WS] Sent initial mode '{state.mode}' to {device_id}")
         except Exception as e:
             print(f"[WS] Error sending initial mode: {e}")
+        finally:
+            db.close()
 
     def disconnect(self, device_id: str):
         self.active_connections.pop(device_id, None)
