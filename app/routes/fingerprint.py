@@ -338,7 +338,7 @@ async def start_enrollment(
     user.finger_id = finger_id
     user.enroll_status = EnrollmentStep.PENDING
     user.status = FingerprintStatus.PENDING
-    user.target_device = target_device  # Store which device should handle this
+    user.target_device = target_device
 
     try:
         db.commit()
@@ -962,6 +962,20 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     if not user.finger_id:
         raise HTTPException(status_code=400, detail="User has no fingerprint")
 
+    # CRITICAL FIX: Clear ANY existing recognition state from ALL devices first
+    devices = get_all_device_states(db)
+    for d in devices:
+        d.recognition_target_id = None
+        d.recognition_finger_id = None
+        d.recognition_matched = None
+        d.recognition_updated_at = None
+        if d.mode == "recognize":
+            d.mode = "idle"
+            d.mode_updated_at = datetime.utcnow()
+
+    db.commit()
+    print("[RECOGNIZE] Cleared all existing recognition state from all devices")
+
     # Determine which device should handle recognition
     target_device = None
 
@@ -999,32 +1013,19 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
             status_code=503, detail=f"Target device {target_device} is not online"
         )
 
-    # Clear recognition targets from all devices first
-    devices = get_all_device_states(db)
-    for d in devices:
-        d.recognition_target_id = None
-        d.recognition_finger_id = None
-        d.recognition_matched = None
-        d.recognition_updated_at = None
-
-        if d.device_id == target_device:
-            # Set target device to recognize mode
-            d.mode = "recognize"
-            d.mode_updated_at = datetime.utcnow()
-            d.recognition_target_id = user.finger_id
-            d.recognition_updated_at = datetime.utcnow()
-            print(
-                f"[RECOGNIZE] Set device {target_device} to recognize mode for finger_id {user.finger_id}"
-            )
-        else:
-            # Ensure other devices are not in recognize mode
-            if d.mode == "recognize":
-                d.mode = "idle"
-                d.mode_updated_at = datetime.utcnow()
-                print(f"[RECOGNIZE] Reset device {d.device_id} from recognize to idle")
+    # Now set the target device to recognize mode
+    state.mode = "recognize"
+    state.mode_updated_at = datetime.utcnow()
+    state.recognition_target_id = user.finger_id
+    state.recognition_matched = None
+    state.recognition_finger_id = None
+    state.recognition_updated_at = datetime.utcnow()
 
     try:
         db.commit()
+        print(
+            f"[RECOGNIZE] Set device {target_device} to recognize mode for finger_id {user.finger_id}"
+        )
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -1153,6 +1154,33 @@ def get_recognition_result(
     return {"status": "pending"}
 
 
+# CANCEL RECOGNITION - Clear any pending recognition state
+@router.post("/cancel-recognition/{user_id}")
+async def cancel_recognition(
+    user_id: int,
+    db: Session = Depends(get_db),
+):
+    """Clear any pending recognition state for a user"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Clear recognition state from all devices
+    devices = get_all_device_states(db)
+    for d in devices:
+        d.recognition_target_id = None
+        d.recognition_finger_id = None
+        d.recognition_matched = None
+        d.recognition_updated_at = None
+        if d.mode == "recognize":
+            d.mode = "idle"
+            d.mode_updated_at = datetime.utcnow()
+
+    db.commit()
+
+    return {"message": "Recognition state cleared successfully"}
+
+
 # DEBUG ENDPOINTS
 @router.get("/debug/all-enrolled")
 def debug_all_enrolled(db: Session = Depends(get_db)):
@@ -1265,30 +1293,3 @@ async def clear_pending_enrollments(db: Session = Depends(get_db)):
 @router.get("/ping")
 def ping():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
-
-
-# CANCEL RECOGNITION - Clear any pending recognition state
-@router.post("/cancel-recognition/{user_id}")
-async def cancel_recognition(
-    user_id: int,
-    db: Session = Depends(get_db),
-):
-    """Clear any pending recognition state for a user"""
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # Clear recognition state from all devices
-    devices = get_all_device_states(db)
-    for d in devices:
-        d.recognition_target_id = None
-        d.recognition_finger_id = None
-        d.recognition_matched = None
-        d.recognition_updated_at = None
-        if d.mode == "recognize":
-            d.mode = "idle"
-            d.mode_updated_at = datetime.utcnow()
-
-    db.commit()
-
-    return {"message": "Recognition state cleared successfully"}
