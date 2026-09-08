@@ -1265,3 +1265,30 @@ async def clear_pending_enrollments(db: Session = Depends(get_db)):
 @router.get("/ping")
 def ping():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+
+# CANCEL RECOGNITION - Clear any pending recognition state
+@router.post("/cancel-recognition/{user_id}")
+async def cancel_recognition(
+    user_id: int,
+    db: Session = Depends(get_db),
+):
+    """Clear any pending recognition state for a user"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Clear recognition state from all devices
+    devices = get_all_device_states(db)
+    for d in devices:
+        d.recognition_target_id = None
+        d.recognition_finger_id = None
+        d.recognition_matched = None
+        d.recognition_updated_at = None
+        if d.mode == "recognize":
+            d.mode = "idle"
+            d.mode_updated_at = datetime.utcnow()
+
+    db.commit()
+
+    return {"message": "Recognition state cleared successfully"}
