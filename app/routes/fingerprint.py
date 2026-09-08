@@ -207,7 +207,7 @@ def ws_status():
 @router.get("/online-devices")
 def get_online_devices_endpoint(db: Session = Depends(get_db)):
     """Get list of online devices for admin to select"""
-    devices = get_all_device_states(db)  # Show all devices
+    devices = get_all_device_states(db)
     return {
         "online_devices": [
             {
@@ -312,7 +312,6 @@ async def start_enrollment(
             )
 
         # CRITICAL FIX: Only set the TARGET device to enroll mode
-        # DO NOT set all devices to enroll mode
         target_state.mode = "enroll"
         target_state.mode_updated_at = datetime.utcnow()
         db.commit()
@@ -350,10 +349,8 @@ async def start_enrollment(
 
     # CRITICAL FIX: Only send mode to the selected device, NOT broadcast
     if target_device:
-        # Only send to the specific device
         ws_manager.schedule(ws_manager.send_mode_update(target_device, "enroll"))
     else:
-        # Only broadcast if no specific device was selected
         ws_manager.schedule(ws_manager.broadcast_mode("enroll"))
 
     return {
@@ -389,29 +386,17 @@ def check_enrollment(
     state = get_device_state(db, device_id)
 
     # CRITICAL FIX: Only look for users that are targeted to THIS device
-    # OR users that have no target device (legacy behavior)
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
         .filter(User.enroll_status == EnrollmentStep.PENDING)
         .filter(User.claimed_by_device.is_(None))
-        .filter(
-            # User is specifically targeted to this device
-            (User.target_device == device_id)
-            |
-            # OR user has no target (legacy - any device can take it)
-            (User.target_device.is_(None))
-        )
-        .order_by(
-            # Prioritize users specifically targeted to this device
-            User.target_device == device_id,  # True comes first
-            User.id.asc(),
-        )
+        .filter((User.target_device == device_id) | (User.target_device.is_(None)))
+        .order_by(User.target_device == device_id, User.id.asc())
         .first()
     )
 
     if user:
-        # Double-check: if this user has a target device, make sure it's THIS device
         if user.target_device and user.target_device != device_id:
             _last_check_enrollment_result = None
             _last_check_enrollment_time = current_time
@@ -463,9 +448,7 @@ def check_enrollment(
         _last_check_enrollment_time = current_time
         return PlainTextResponse(str(user.finger_id))
 
-    # If this device was in enroll mode but has no work, set it to idle
     if state.mode == "enroll":
-        # Check if there are any pending users targeted to this device
         pending_count = (
             db.query(User)
             .filter(User.status == FingerprintStatus.PENDING)
@@ -563,7 +546,7 @@ def update_enrollment(
         user.status = fingerprint_status
         user.finger_id = None
         user.claimed_by_device = None
-        user.target_device = None  # Clear target device
+        user.target_device = None
 
         matching_state.pending_delete_id = None
         matching_state.pending_delete_user_id = None
@@ -586,7 +569,7 @@ def update_enrollment(
 
         if status in ("success", "error"):
             user.claimed_by_device = None
-            user.target_device = None  # Clear target device
+            user.target_device = None
 
     try:
         db.commit()
@@ -652,7 +635,7 @@ async def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get
     user.enroll_status = EnrollmentStep.NOT_ENROLLED
     user.status = FingerprintStatus.NOT_ENROLLED
     user.claimed_by_device = None
-    user.target_device = None  # Clear target device
+    user.target_device = None
 
     set_mode_on_all_devices(db, "idle")
     ws_manager.schedule(ws_manager.broadcast_mode("idle"))
@@ -967,28 +950,78 @@ def get_device_mode(
     return PlainTextResponse(mode)
 
 
-# START RECOGNITION
+# START RECOGNITION - FIXED
 @router.post("/start-recognition/{user_id}")
 async def start_recognition(user_id: int, db: Session = Depends(get_db)):
+    """Start recognition on the device where the fingerprint is enrolled"""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     if user.status != FingerprintStatus.ENROLLED:
         raise HTTPException(status_code=400, detail="User not enrolled")
+    if not user.finger_id:
+        raise HTTPException(status_code=400, detail="User has no fingerprint")
 
-    if not any(is_device_online(s) for s in get_all_device_states(db)):
-        raise HTTPException(status_code=503, detail="No ESP32 device online")
+    # Determine which device should handle recognition
+    target_device = None
 
-    ensure_all_devices_free(db, "recognize")
+    # 1. Check if user has a target_device stored
+    if user.target_device:
+        target_device = user.target_device
+        print(f"[RECOGNIZE] Using user's target_device: {target_device}")
 
+    # 2. Check system-wide target
+    if not target_device:
+        target_device = get_system_target_device(db)
+        if target_device:
+            print(f"[RECOGNIZE] Using system target_device: {target_device}")
+
+    # 3. Check if user was claimed by a device during enrollment
+    if not target_device and user.claimed_by_device:
+        target_device = user.claimed_by_device
+        print(f"[RECOGNIZE] Using claimed_by_device: {target_device}")
+
+    # 4. Fallback to any online device
+    if not target_device:
+        online_devices = get_online_devices(db)
+        if online_devices:
+            target_device = online_devices[0].device_id
+            print(f"[RECOGNIZE] Using first online device: {target_device}")
+        else:
+            raise HTTPException(
+                status_code=503, detail="No online devices available for recognition"
+            )
+
+    # Verify target device is online
+    state = get_device_state(db, target_device)
+    if not is_device_online(state):
+        raise HTTPException(
+            status_code=503, detail=f"Target device {target_device} is not online"
+        )
+
+    # Clear recognition targets from all devices first
     devices = get_all_device_states(db)
     for d in devices:
-        d.mode = "recognize"
-        d.mode_updated_at = datetime.utcnow()
-        d.recognition_target_id = user.finger_id
+        d.recognition_target_id = None
         d.recognition_finger_id = None
         d.recognition_matched = None
-        d.recognition_updated_at = datetime.utcnow()
+        d.recognition_updated_at = None
+
+        if d.device_id == target_device:
+            # Set target device to recognize mode
+            d.mode = "recognize"
+            d.mode_updated_at = datetime.utcnow()
+            d.recognition_target_id = user.finger_id
+            d.recognition_updated_at = datetime.utcnow()
+            print(
+                f"[RECOGNIZE] Set device {target_device} to recognize mode for finger_id {user.finger_id}"
+            )
+        else:
+            # Ensure other devices are not in recognize mode
+            if d.mode == "recognize":
+                d.mode = "idle"
+                d.mode_updated_at = datetime.utcnow()
+                print(f"[RECOGNIZE] Reset device {d.device_id} from recognize to idle")
 
     try:
         db.commit()
@@ -996,15 +1029,18 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-    ws_manager.schedule(ws_manager.broadcast_mode("recognize"))
+    # CRITICAL FIX: Only send to the TARGET device, NOT broadcast
+    ws_manager.schedule(ws_manager.send_mode_update(target_device, "recognize"))
 
     return {
-        "message": "Recognition test started",
+        "message": f"Recognition test started on device {target_device}",
         "target_finger_id": user.finger_id,
+        "target_device": target_device,
+        "user_name": f"{user.first_name} {user.last_name}",
     }
 
 
-# RECOGNITION RESULT
+# RECOGNITION RESULT - FIXED
 @router.get("/recognition-result")
 def recognition_result(
     finger_id: int,
@@ -1015,7 +1051,19 @@ def recognition_result(
     state = get_device_state(db, device_id)
 
     if state.recognition_target_id is None:
+        print(f"[RECOGNIZE] Device {device_id} has no active recognition target")
         return PlainTextResponse("no_active_recognition")
+
+    # Verify this device is the one that should be doing recognition
+    if state.mode != "recognize":
+        print(
+            f"[RECOGNIZE] Device {device_id} is not in recognize mode (mode={state.mode})"
+        )
+        return PlainTextResponse("device_not_in_recognition_mode")
+
+    print(
+        f"[RECOGNIZE] Device {device_id} processing recognition: finger_id={finger_id}, matched={matched}"
+    )
 
     from sqlalchemy import update
 
@@ -1032,24 +1080,31 @@ def recognition_result(
     result = db.execute(stmt)
 
     if result.rowcount == 0:
+        print(f"[RECOGNIZE] Device {device_id} already processed")
         return PlainTextResponse("already_processed")
 
+    # Clear recognition target from all devices
     for s in get_all_device_states(db):
         s.recognition_target_id = None
+
+    # Set this device back to idle
+    state.mode = "idle"
+    state.mode_updated_at = datetime.utcnow()
 
     try:
         db.commit()
     except Exception as e:
         db.rollback()
+        print(f"[RECOGNIZE] Error committing result: {e}")
         return PlainTextResponse("error")
 
-    set_mode_on_all_devices(db, "idle")
-    ws_manager.schedule(ws_manager.broadcast_mode("idle"))
+    # Only send idle to the specific device, not broadcast
+    ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
 
     return PlainTextResponse("ok")
 
 
-# GET RECOGNITION RESULT
+# GET RECOGNITION RESULT - FIXED
 @router.get("/get-recognition-result")
 def get_recognition_result(
     finger_id: int,
@@ -1060,6 +1115,10 @@ def get_recognition_result(
     stale_cutoff = now - timedelta(seconds=60)
 
     state = get_device_state(db, device_id)
+
+    # Only check if this device is in recognition mode
+    if state.mode != "recognize":
+        return {"status": "not_in_recognition_mode"}
 
     if (
         state.mode == "recognize"
@@ -1082,7 +1141,9 @@ def get_recognition_result(
         state.recognition_finger_id = None
         state.recognition_matched = None
         state.recognition_updated_at = None
+        state.mode = "idle"
         db.commit()
+        ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
         return {
             "status": "done",
             "matched": matched,
@@ -1105,6 +1166,7 @@ def debug_all_enrolled(db: Session = Depends(get_db)):
             "status": u.status.value,
             "enroll_status": u.enroll_status.value if u.enroll_status else None,
             "target_device": u.target_device,
+            "claimed_by_device": u.claimed_by_device,
         }
         for u in users
     ]
