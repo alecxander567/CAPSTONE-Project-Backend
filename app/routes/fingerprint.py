@@ -1088,9 +1088,13 @@ def recognition_result(
     for s in get_all_device_states(db):
         s.recognition_target_id = None
 
-    # Set this device back to idle
-    state.mode = "idle"
-    state.mode_updated_at = datetime.utcnow()
+    # NOTE: We intentionally do NOT flip state.mode to "idle" here anymore.
+    # Doing so used to race with get_recognition_result's polling, which
+    # checked `mode != "recognize"` BEFORE checking whether a result had
+    # landed - so a result posted here could get missed by the poller
+    # because mode had already moved to "idle". get_recognition_result now
+    # checks for a completed result first and is responsible for flipping
+    # mode back to idle once it has delivered the result to the frontend.
 
     try:
         db.commit()
@@ -1098,9 +1102,6 @@ def recognition_result(
         db.rollback()
         print(f"[RECOGNIZE] Error committing result: {e}")
         return PlainTextResponse("error")
-
-    # Only send idle to the specific device, not broadcast
-    ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
 
     return PlainTextResponse("ok")
 
@@ -1117,14 +1118,31 @@ def get_recognition_result(
 
     state = get_device_state(db, device_id)
 
-    # CHECK FOR A COMPLETED RESULT FIRST — before gating on mode.
-    # The ESP32 already flipped mode to "idle" when it posted the result,
-    # so checking mode first (old code) meant this branch never ran.
+    # FIX 1 (ordering): check for a completed result FIRST, before gating
+    # on mode. Previously `mode != "recognize"` was checked first, and
+    # since recognition-result used to flip mode to "idle" as soon as it
+    # recorded the match, every subsequent poll fell into the
+    # "not_in_recognition_mode" branch and the frontend never saw the
+    # actual result - it just timed out.
+    #
+    # FIX 2 (correctness): also verify the recorded result actually
+    # belongs to the finger_id we're polling for. Without this, a stale or
+    # unrelated match sitting on the device could be handed to whoever
+    # happens to be polling, showing a result before the person ever
+    # placed their finger.
     if state.recognition_matched is not None:
+        if (
+            state.recognition_target_id is not None
+            and state.recognition_target_id != finger_id
+        ):
+            # This result belongs to a different recognition attempt - not ours.
+            return {"status": "pending"}
+
         matched = state.recognition_matched
         scanned_id = state.recognition_finger_id
         state.recognition_finger_id = None
         state.recognition_matched = None
+        state.recognition_target_id = None
         state.recognition_updated_at = None
         state.mode = "idle"
         db.commit()
@@ -1139,7 +1157,6 @@ def get_recognition_result(
     if state.mode != "recognize":
         return {"status": "not_in_recognition_mode"}
 
-    # Stale/timeout check — only relevant if still waiting on a target
     if (
         state.recognition_target_id is not None
         and state.recognition_updated_at
