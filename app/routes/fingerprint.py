@@ -85,6 +85,15 @@ class DeviceConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
         self.device_modes: Dict[str, str] = {}
+        # FIX: per-device recognition "session id". Generated fresh every time
+        # start_recognition begins a new attempt on a device. The ESP32 is
+        # told this id and must echo it back on /recognition-result. Any
+        # result that arrives without the CURRENT id for that device is
+        # rejected as stale — this is what actually closes the race where a
+        # late/leftover result from a previous (cancelled/superseded)
+        # attempt was being accepted as the result of a brand-new attempt
+        # the user hadn't scanned their finger for yet.
+        self.recognition_sessions: Dict[str, Optional[int]] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -125,6 +134,7 @@ class DeviceConnectionManager:
     def disconnect(self, device_id: str):
         self.active_connections.pop(device_id, None)
         self.device_modes.pop(device_id, None)
+        self.recognition_sessions.pop(device_id, None)
         print(f"[WS] Device {device_id} disconnected")
 
     async def send_mode_update(self, device_id: str, mode: str):
@@ -157,6 +167,34 @@ class DeviceConnectionManager:
             except Exception as e:
                 print(f"[WS] Error broadcasting to {device_id}: {e}")
                 self.disconnect(device_id)
+
+    # FIX: dedicated recognize-start command that carries a fresh session id.
+    # The device must echo this id back on /recognition-result; anything
+    # posted with a different (or missing) id is a stale attempt and is
+    # discarded server-side without touching state.
+    async def send_recognize_command(self, device_id: str, session_id: int):
+        self.recognition_sessions[device_id] = session_id
+        if device_id in self.active_connections:
+            try:
+                await self.active_connections[device_id].send_text(
+                    f"mode:recognize:{session_id}"
+                )
+                self.device_modes[device_id] = "recognize"
+                print(
+                    f"[WS] Sent recognize (session={session_id}) to device {device_id}"
+                )
+                return True
+            except Exception as e:
+                print(f"[WS] Error sending recognize to {device_id}: {e}")
+                self.disconnect(device_id)
+        else:
+            print(f"[WS] Device {device_id} not connected")
+        return False
+
+    def invalidate_recognition_session(self, device_id: str):
+        """Call whenever a device leaves recognize mode, so any late/stale
+        POST for the old session id can never be accepted again."""
+        self.recognition_sessions[device_id] = None
 
 
 ws_manager = DeviceConnectionManager()
@@ -664,6 +702,7 @@ async def cancel_operation(db: Session = Depends(get_db)):
         d.recognition_matched = None
         d.active_event_id = None
         d.target_device_id = None
+        ws_manager.invalidate_recognition_session(d.device_id)
 
     pending_users = (
         db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
@@ -962,7 +1001,9 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     if not user.finger_id:
         raise HTTPException(status_code=400, detail="User has no fingerprint")
 
-    # CRITICAL FIX: Clear ANY existing recognition state from ALL devices first
+    # Clear ANY existing recognition state from ALL devices first, and
+    # invalidate any session id so a late POST from a prior attempt can
+    # never be mistaken for the one we're about to start.
     devices = get_all_device_states(db)
     for d in devices:
         d.recognition_target_id = None
@@ -972,6 +1013,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
         if d.mode == "recognize":
             d.mode = "idle"
             d.mode_updated_at = datetime.utcnow()
+        ws_manager.invalidate_recognition_session(d.device_id)
 
     db.commit()
     print("[RECOGNIZE] Cleared all existing recognition state from all devices")
@@ -979,23 +1021,19 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     # Determine which device should handle recognition
     target_device = None
 
-    # 1. Check if user has a target_device stored
     if user.target_device:
         target_device = user.target_device
         print(f"[RECOGNIZE] Using user's target_device: {target_device}")
 
-    # 2. Check system-wide target
     if not target_device:
         target_device = get_system_target_device(db)
         if target_device:
             print(f"[RECOGNIZE] Using system target_device: {target_device}")
 
-    # 3. Check if user was claimed by a device during enrollment
     if not target_device and user.claimed_by_device:
         target_device = user.claimed_by_device
         print(f"[RECOGNIZE] Using claimed_by_device: {target_device}")
 
-    # 4. Fallback to any online device
     if not target_device:
         online_devices = get_online_devices(db)
         if online_devices:
@@ -1006,14 +1044,17 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
                 status_code=503, detail="No online devices available for recognition"
             )
 
-    # Verify target device is online
     state = get_device_state(db, target_device)
     if not is_device_online(state):
         raise HTTPException(
             status_code=503, detail=f"Target device {target_device} is not online"
         )
 
-    # Now set the target device to recognize mode
+    # FIX: generate a fresh session id for THIS attempt. It's stored in
+    # ws_manager (source of truth for validating the eventual POST) and also
+    # mirrored onto recognition_target_id below for the polling endpoint.
+    session_id = random.randint(1, 2_147_000_000)
+
     state.mode = "recognize"
     state.mode_updated_at = datetime.utcnow()
     state.recognition_target_id = user.finger_id
@@ -1024,20 +1065,23 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     try:
         db.commit()
         print(
-            f"[RECOGNIZE] Set device {target_device} to recognize mode for finger_id {user.finger_id}"
+            f"[RECOGNIZE] Set device {target_device} to recognize mode for finger_id {user.finger_id} (session={session_id})"
         )
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-    # CRITICAL FIX: Only send to the TARGET device, NOT broadcast
-    ws_manager.schedule(ws_manager.send_mode_update(target_device, "recognize"))
+    # Send the recognize command WITH the session id — only a POST that
+    # echoes this exact session id back will be accepted as this attempt's
+    # result.
+    ws_manager.schedule(ws_manager.send_recognize_command(target_device, session_id))
 
     return {
         "message": f"Recognition test started on device {target_device}",
         "target_finger_id": user.finger_id,
         "target_device": target_device,
         "user_name": f"{user.first_name} {user.last_name}",
+        "session_id": session_id,
     }
 
 
@@ -1047,15 +1091,28 @@ def recognition_result(
     finger_id: int,
     matched: bool,
     device_id: str = DEFAULT_DEVICE_ID,
+    session_id: int = -1,
     db: Session = Depends(get_db),
 ):
+    # FIX: the core fix. Reject anything that doesn't carry the session id
+    # we most recently issued to this device. This is what actually
+    # prevents a stale/late result (from a cancelled or superseded attempt)
+    # from being accepted into a brand-new attempt the user hasn't scanned
+    # their finger for yet — regardless of DB field timing/ordering.
+    current_session = ws_manager.recognition_sessions.get(device_id)
+    if current_session is None or session_id != current_session:
+        print(
+            f"[RECOGNIZE] Device {device_id} posted stale/mismatched session "
+            f"(got={session_id}, expected={current_session}) — ignored"
+        )
+        return PlainTextResponse("stale_ignored")
+
     state = get_device_state(db, device_id)
 
     if state.recognition_target_id is None:
         print(f"[RECOGNIZE] Device {device_id} has no active recognition target")
         return PlainTextResponse("no_active_recognition")
 
-    # Verify this device is the one that should be doing recognition
     if state.mode != "recognize":
         print(
             f"[RECOGNIZE] Device {device_id} is not in recognize mode (mode={state.mode})"
@@ -1084,17 +1141,15 @@ def recognition_result(
         print(f"[RECOGNIZE] Device {device_id} already processed")
         return PlainTextResponse("already_processed")
 
-    # Clear recognition target from all devices
-    for s in get_all_device_states(db):
-        s.recognition_target_id = None
+    # NOTE: we intentionally do NOT touch other devices' recognition_target_id
+    # here anymore — clearing it globally used to strip the safety check in
+    # get_recognition_result (it treats target_id == None as "trust this
+    # value"), which was part of how a stale result could leak across
+    # devices/sessions. The session-id check above is now the sole gate.
 
-    # NOTE: We intentionally do NOT flip state.mode to "idle" here anymore.
-    # Doing so used to race with get_recognition_result's polling, which
-    # checked `mode != "recognize"` BEFORE checking whether a result had
-    # landed - so a result posted here could get missed by the poller
-    # because mode had already moved to "idle". get_recognition_result now
-    # checks for a completed result first and is responsible for flipping
-    # mode back to idle once it has delivered the result to the frontend.
+    # We intentionally do NOT flip state.mode to "idle" here — see
+    # get_recognition_result for why (avoids a race where a result posted
+    # here could get missed by the poller).
 
     try:
         db.commit()
@@ -1118,24 +1173,11 @@ def get_recognition_result(
 
     state = get_device_state(db, device_id)
 
-    # FIX 1 (ordering): check for a completed result FIRST, before gating
-    # on mode. Previously `mode != "recognize"` was checked first, and
-    # since recognition-result used to flip mode to "idle" as soon as it
-    # recorded the match, every subsequent poll fell into the
-    # "not_in_recognition_mode" branch and the frontend never saw the
-    # actual result - it just timed out.
-    #
-    # FIX 2 (correctness): also verify the recorded result actually
-    # belongs to the finger_id we're polling for. Without this, a stale or
-    # unrelated match sitting on the device could be handed to whoever
-    # happens to be polling, showing a result before the person ever
-    # placed their finger.
     if state.recognition_matched is not None:
         if (
             state.recognition_target_id is not None
             and state.recognition_target_id != finger_id
         ):
-            # This result belongs to a different recognition attempt - not ours.
             return {"status": "pending"}
 
         matched = state.recognition_matched
@@ -1146,6 +1188,7 @@ def get_recognition_result(
         state.recognition_updated_at = None
         state.mode = "idle"
         db.commit()
+        ws_manager.invalidate_recognition_session(device_id)
         ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
         return {
             "status": "done",
@@ -1153,7 +1196,6 @@ def get_recognition_result(
             "scanned_finger_id": scanned_id,
         }
 
-    # Only now check if we're not (or no longer) in recognition mode
     if state.mode != "recognize":
         return {"status": "not_in_recognition_mode"}
 
@@ -1168,6 +1210,7 @@ def get_recognition_result(
         state.recognition_updated_at = None
         state.mode = "idle"
         db.commit()
+        ws_manager.invalidate_recognition_session(device_id)
         ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
         return {"status": "timeout"}
 
@@ -1185,7 +1228,6 @@ async def cancel_recognition(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Clear recognition state from all devices
     devices = get_all_device_states(db)
     for d in devices:
         d.recognition_target_id = None
@@ -1195,6 +1237,7 @@ async def cancel_recognition(
         if d.mode == "recognize":
             d.mode = "idle"
             d.mode_updated_at = datetime.utcnow()
+        ws_manager.invalidate_recognition_session(d.device_id)
 
     db.commit()
 
@@ -1235,6 +1278,7 @@ def debug_device_state(db: Session = Depends(get_db)):
                 "recognition_target_id": s.recognition_target_id,
                 "recognition_finger_id": s.recognition_finger_id,
                 "recognition_matched": s.recognition_matched,
+                "recognition_session": ws_manager.recognition_sessions.get(s.device_id),
                 "pending_delete_id": s.pending_delete_id,
                 "pending_delete_user_id": s.pending_delete_user_id,
                 "pending_delete_updated_at": s.pending_delete_updated_at,
