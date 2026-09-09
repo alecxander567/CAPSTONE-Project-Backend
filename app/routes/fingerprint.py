@@ -49,7 +49,6 @@ CACHE_TTL_SECONDS = 1
 
 class EnrollmentRequest(BaseModel):
     user_id: int
-    target_device: Optional[str] = None
 
 
 class StartAttendanceRequest(BaseModel):
@@ -158,16 +157,18 @@ class DeviceConnectionManager:
                 print(f"[WS] Error broadcasting to {device_id}: {e}")
                 self.disconnect(device_id)
 
-    async def send_recognize_command(self, device_id: str, session_id: int):
+    async def send_recognize_command(
+        self, device_id: str, session_id: int, finger_id: int
+    ):
         self.recognition_sessions[device_id] = session_id
         if device_id in self.active_connections:
             try:
                 await self.active_connections[device_id].send_text(
-                    f"mode:recognize:{session_id}"
+                    f"mode:recognize:{session_id}:{finger_id}"
                 )
                 self.device_modes[device_id] = "recognize"
                 print(
-                    f"[WS] Sent recognize (session={session_id}) to device {device_id}"
+                    f"[WS] Sent recognize (session={session_id}, finger={finger_id}) to device {device_id}"
                 )
                 return True
             except Exception as e:
@@ -242,50 +243,7 @@ def get_online_devices_endpoint(db: Session = Depends(get_db)):
     }
 
 
-# Set system-wide target device
-@router.post("/set-target-device")
-async def set_target_device_endpoint(
-    request: DeviceSelectionRequest, db: Session = Depends(get_db)
-):
-    device_id = request.device_id
-
-    state = get_device_state(db, device_id)
-    if not is_device_online(state):
-        raise HTTPException(status_code=400, detail=f"Device {device_id} is not online")
-
-    set_system_target_device(db, device_id)
-
-    return {
-        "message": f"Target device set to {device_id}",
-        "device_id": device_id,
-        "is_online": True,
-    }
-
-
-# Clear system-wide target device
-@router.post("/clear-target-device")
-async def clear_target_device_endpoint(db: Session = Depends(get_db)):
-    clear_system_target_device(db)
-    return {"message": "Target device cleared - will use any available device"}
-
-
-# Get current system-wide target device
-@router.get("/target-device")
-def get_target_device_endpoint(db: Session = Depends(get_db)):
-    target_device = get_system_target_device(db)
-
-    if target_device:
-        state = get_device_state(db, target_device)
-        return {
-            "target_device": target_device,
-            "is_set": True,
-            "is_online": is_device_online(state),
-        }
-    else:
-        return {"target_device": None, "is_set": False, "is_online": False}
-
-
-# START ENROLLMENT
+# START ENROLLMENT - SIMPLIFIED
 @router.post("/start-enrollment")
 async def start_enrollment(
     request: EnrollmentRequest,
@@ -293,48 +251,29 @@ async def start_enrollment(
     db: Session = Depends(get_db),
 ):
     client_ip = req.client.host
-    target_device = request.target_device
+    user_id = request.user_id
 
-    if not target_device:
-        target_device = get_system_target_device(db)
+    log_request("START-ENROLLMENT", client_ip, f"| user_id={user_id}")
 
-    log_request(
-        "START-ENROLLMENT",
-        client_ip,
-        f"| user_id={request.user_id} | target_device={target_device or 'ANY'}",
-    )
-
-    user = db.query(User).filter(User.id == request.user_id).first()
+    user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if target_device:
-        target_state = get_device_state(db, target_device)
-        if not is_device_online(target_state):
-            raise HTTPException(
-                status_code=400, detail=f"Target device {target_device} is not online"
-            )
+    # Check if there are online devices
+    online_devices = get_online_devices(db)
+    if not online_devices:
+        raise HTTPException(
+            status_code=503, detail="No online devices available for enrollment"
+        )
 
-        try:
-            ensure_all_devices_free(db, "enroll", target_device=target_device)
-        except HTTPException as e:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Target device {target_device} is busy: {e.detail}",
-            )
-
-        target_state.mode = "enroll"
-        target_state.mode_updated_at = datetime.utcnow()
-        db.commit()
-    else:
-        ensure_all_devices_free(db, "enroll")
-        set_mode_on_all_devices(db, "enroll")
-
+    # Reset user's enrollment state if already enrolled
     if user.status != FingerprintStatus.NOT_ENROLLED:
         user.finger_id = None
         user.enroll_status = EnrollmentStep.NOT_ENROLLED
         user.status = FingerprintStatus.NOT_ENROLLED
+        user.target_device = None
 
+    # Generate unique finger_id
     existing_ids = {u.finger_id for u in db.query(User.finger_id).all() if u.finger_id}
     existing_ids |= _finger_ids_in_flight(db)
 
@@ -348,15 +287,7 @@ async def start_enrollment(
     user.finger_id = finger_id
     user.enroll_status = EnrollmentStep.PENDING
     user.status = FingerprintStatus.PENDING
-    # NOTE: when target_device is None here (broadcast / "ANY device"
-    # enrollment), user.target_device is intentionally left unset for
-    # now. We don't yet know which physical device will actually claim
-    # and complete this enrollment — that's recorded in
-    # claimed_by_device by check-enrollment once a device picks it up.
-    # update_enrollment copies claimed_by_device into target_device on
-    # success, which is the only point where we actually know which
-    # sensor now holds the template.
-    user.target_device = target_device
+    # target_device will be set when enrollment succeeds
 
     try:
         db.commit()
@@ -365,21 +296,19 @@ async def start_enrollment(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    if target_device:
-        ws_manager.schedule(ws_manager.send_mode_update(target_device, "enroll"))
-    else:
-        ws_manager.schedule(ws_manager.broadcast_mode("enroll"))
+    # Send enrollment mode to ALL online devices
+    for device in online_devices:
+        ws_manager.schedule(ws_manager.send_mode_update(device.device_id, "enroll"))
 
     return {
-        "message": "Enrollment started",
+        "message": "Enrollment started on all available devices",
         "finger_id": finger_id,
         "status": user.status.value,
         "step": "pending",
-        "target_device": target_device or "ANY",
     }
 
 
-# CHECK ENROLLMENT
+# CHECK ENROLLMENT - SIMPLIFIED
 _last_check_enrollment_result = None
 _last_check_enrollment_time = 0
 _CHECK_ENROLLMENT_CACHE_MS = 100
@@ -402,23 +331,19 @@ def check_enrollment(
 
     state = get_device_state(db, device_id)
 
+    # Find a pending enrollment that hasn't been assigned to any device yet
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
         .filter(User.enroll_status == EnrollmentStep.PENDING)
-        .filter(User.claimed_by_device.is_(None))
-        .filter((User.target_device == device_id) | (User.target_device.is_(None)))
-        .order_by(User.target_device == device_id, User.id.asc())
+        .filter(User.target_device.is_(None))  # Not yet assigned to a device
+        .order_by(User.id.asc())
         .first()
     )
 
     if user:
-        if user.target_device and user.target_device != device_id:
-            _last_check_enrollment_result = None
-            _last_check_enrollment_time = current_time
-            return PlainTextResponse("none")
-
-        user.claimed_by_device = device_id
+        # Assign this device to the user
+        user.target_device = device_id
         try:
             db.commit()
         except Exception:
@@ -430,12 +355,13 @@ def check_enrollment(
         log_request(
             "CHECK-ENROLLMENT",
             client_ip,
-            f"| Found finger_id={user.finger_id} for device={device_id} | target_device={user.target_device}",
+            f"| Found finger_id={user.finger_id} for device={device_id}",
         )
         _last_check_enrollment_result = user.finger_id
         _last_check_enrollment_time = current_time
         return PlainTextResponse(str(user.finger_id))
 
+    # Check for active enrollment on this device (resume)
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
@@ -448,7 +374,7 @@ def check_enrollment(
                 ]
             )
         )
-        .filter(User.claimed_by_device == device_id)
+        .filter(User.target_device == device_id)
         .order_by(User.id.asc())
         .first()
     )
@@ -463,12 +389,12 @@ def check_enrollment(
         _last_check_enrollment_time = current_time
         return PlainTextResponse(str(user.finger_id))
 
+    # If in enroll mode but no pending work, go back to idle
     if state.mode == "enroll":
         pending_count = (
             db.query(User)
             .filter(User.status == FingerprintStatus.PENDING)
-            .filter(User.claimed_by_device.is_(None))
-            .filter((User.target_device == device_id) | (User.target_device.is_(None)))
+            .filter(User.target_device.is_(None))
             .count()
         )
 
@@ -487,7 +413,7 @@ def check_enrollment(
     return PlainTextResponse("none")
 
 
-# UPDATE ENROLLMENT
+# UPDATE ENROLLMENT - SIMPLIFIED
 @router.get("/update-enrollment")
 def update_enrollment(
     req: Request,
@@ -509,6 +435,19 @@ def update_enrollment(
     user = db.query(User).filter(User.finger_id == id).first()
     if not user:
         return PlainTextResponse("error")
+
+    # Check if this is the correct device for this user
+    if (
+        user.target_device
+        and user.target_device != device_id
+        and status not in ["success", "error", "delete_success", "delete_error"]
+    ):
+        log_request(
+            "UPDATE-ENROLLMENT",
+            client_ip,
+            f"| finger_id={id} | IGNORED - wrong device (expected={user.target_device}, got={device_id})",
+        )
+        return PlainTextResponse("wrong_device")
 
     if status in ("place_finger", "remove_finger", "place_again", "success", "error"):
         if user.status != FingerprintStatus.PENDING:
@@ -536,6 +475,7 @@ def update_enrollment(
     enroll_step, fingerprint_status = status_map[status]
 
     if status == "delete_success":
+        # Clear pending delete
         matching_state = (
             db.query(DeviceState)
             .filter_by(pending_delete_id=id, pending_delete_user_id=user.id)
@@ -546,8 +486,7 @@ def update_enrollment(
             log_request(
                 "UPDATE-ENROLLMENT",
                 client_ip,
-                f"| finger_id={id} | IGNORED stale delete_success "
-                f"(no matching pending_delete for user_id={user.id})",
+                f"| finger_id={id} | IGNORED stale delete_success",
             )
             for s in get_all_device_states(db):
                 if s.pending_delete_id == id:
@@ -560,7 +499,6 @@ def update_enrollment(
         user.enroll_status = enroll_step
         user.status = fingerprint_status
         user.finger_id = None
-        user.claimed_by_device = None
         user.target_device = None
 
         matching_state.pending_delete_id = None
@@ -582,30 +520,9 @@ def update_enrollment(
         user.enroll_status = enroll_step
         user.status = fingerprint_status
 
-        # FIX: the fingerprint template physically lives on whichever
-        # device actually performed the enrollment scan — that's
-        # claimed_by_device, set by check-enrollment the moment a real
-        # ESP32 picked up this pending user. This is true whether the
-        # enrollment was targeted at a specific device OR broadcast to
-        # "ANY device" (in the broadcast case, target_device is None
-        # until this exact point — claimed_by_device is the only record
-        # of which physical sensor actually did it).
-        #
-        # On success: copy claimed_by_device into target_device (only if
-        # target_device isn't already set, which covers the "ANY device"
-        # broadcast case) so future recognition attempts always go back
-        # to the same physical sensor that holds the template. Then
-        # clear claimed_by_device — it's just the transient claim lock
-        # used during the enrollment handshake and has no further use.
-        #
-        # On error: nothing was actually stored on any sensor, so there
-        # is no device binding to preserve — clear both.
-        if status == "success":
-            if not user.target_device:
-                user.target_device = user.claimed_by_device
-            user.claimed_by_device = None
-        elif status == "error":
-            user.claimed_by_device = None
+        # On success: keep target_device (already set by check-enrollment)
+        # On error: clear target_device
+        if status == "error":
             user.target_device = None
 
     try:
@@ -614,6 +531,7 @@ def update_enrollment(
         db.rollback()
         return PlainTextResponse("error")
 
+    # If completed, reset all devices to idle
     if status in ["success", "error", "delete_success", "delete_error"]:
         set_mode_on_all_devices(db, "idle")
         ws_manager.schedule(ws_manager.broadcast_mode("idle"))
@@ -671,7 +589,6 @@ async def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get
     user.finger_id = None
     user.enroll_status = EnrollmentStep.NOT_ENROLLED
     user.status = FingerprintStatus.NOT_ENROLLED
-    user.claimed_by_device = None
     user.target_device = None
 
     set_mode_on_all_devices(db, "idle")
@@ -710,7 +627,6 @@ async def cancel_operation(db: Session = Depends(get_db)):
         u.finger_id = None
         u.enroll_status = EnrollmentStep.NOT_ENROLLED
         u.status = FingerprintStatus.NOT_ENROLLED
-        u.claimed_by_device = None
         u.target_device = None
 
     try:
@@ -740,7 +656,8 @@ async def unenroll_fingerprint(
     if not user.finger_id:
         raise HTTPException(status_code=400, detail="User has no finger_id")
 
-    if not any(is_device_online(s) for s in get_all_device_states(db)):
+    online_devices = get_online_devices(db)
+    if not online_devices:
         raise HTTPException(
             status_code=400,
             detail="No ESP32 device is online. Cannot unenroll fingerprint.",
@@ -988,7 +905,7 @@ def get_device_mode(
     return PlainTextResponse(mode)
 
 
-# START RECOGNITION
+# START RECOGNITION - SIMPLIFIED
 @router.post("/start-recognition/{user_id}")
 async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
@@ -998,8 +915,27 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="User not enrolled")
     if not user.finger_id:
         raise HTTPException(status_code=400, detail="User has no fingerprint")
+    if not user.target_device:
+        raise HTTPException(
+            status_code=400,
+            detail="No target device saved for this user. Please re-enroll.",
+        )
 
-    # Clear ANY existing recognition state from ALL devices
+    # Check if the target device is online
+    state = get_device_state(db, user.target_device)
+    if not is_device_online(state):
+        # Try to find another online device
+        online_devices = get_online_devices(db)
+        if not online_devices:
+            raise HTTPException(
+                status_code=503, detail="No online devices available for recognition"
+            )
+        # Update user's target_device to the first online device
+        user.target_device = online_devices[0].device_id
+        db.commit()
+        state = get_device_state(db, user.target_device)
+
+    # Clear any existing recognition state from ALL devices
     devices = get_all_device_states(db)
     for d in devices:
         d.recognition_target_id = None
@@ -1012,48 +948,9 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
         ws_manager.invalidate_recognition_session(d.device_id)
 
     db.commit()
-    print("[RECOGNIZE] Cleared all existing recognition state from all devices")
+    print(f"[RECOGNIZE] Cleared all existing recognition state")
 
-    # Determine which device should handle recognition.
-    # IMPORTANT: user.target_device is checked FIRST because it now
-    # persists after a successful enrollment (see update_enrollment) and
-    # records which physical sensor actually holds this fingerprint
-    # template — whether the enrollment was targeted at a specific
-    # device or broadcast to "ANY device". Recognition can only ever
-    # succeed against that same physical device, so this must take
-    # priority over the system-wide target device or "first online
-    # device" fallbacks below.
-    target_device = None
-
-    if user.target_device:
-        target_device = user.target_device
-        print(f"[RECOGNIZE] Using user's target_device: {target_device}")
-
-    if not target_device:
-        target_device = get_system_target_device(db)
-        if target_device:
-            print(f"[RECOGNIZE] Using system target_device: {target_device}")
-
-    if not target_device and user.claimed_by_device:
-        target_device = user.claimed_by_device
-        print(f"[RECOGNIZE] Using claimed_by_device: {target_device}")
-
-    if not target_device:
-        online_devices = get_online_devices(db)
-        if online_devices:
-            target_device = online_devices[0].device_id
-            print(f"[RECOGNIZE] Using first online device: {target_device}")
-        else:
-            raise HTTPException(
-                status_code=503, detail="No online devices available for recognition"
-            )
-
-    state = get_device_state(db, target_device)
-    if not is_device_online(state):
-        raise HTTPException(
-            status_code=503, detail=f"Target device {target_device} is not online"
-        )
-
+    # Set the target device to recognize mode
     session_id = random.randint(1, 2_147_000_000)
 
     state.mode = "recognize"
@@ -1066,24 +963,29 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     try:
         db.commit()
         print(
-            f"[RECOGNIZE] Set device {target_device} to recognize mode for finger_id {user.finger_id} (session={session_id})"
+            f"[RECOGNIZE] Set device {user.target_device} to recognize mode for finger_id {user.finger_id} (session={session_id})"
         )
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-    ws_manager.schedule(ws_manager.send_recognize_command(target_device, session_id))
+    # Send recognition command to the target device
+    ws_manager.schedule(
+        ws_manager.send_recognize_command(
+            user.target_device, session_id, user.finger_id
+        )
+    )
 
     return {
-        "message": f"Recognition test started on device {target_device}",
+        "message": f"Recognition test started on device {user.target_device}",
         "target_finger_id": user.finger_id,
-        "target_device": target_device,
+        "target_device": user.target_device,
         "user_name": f"{user.first_name} {user.last_name}",
         "session_id": session_id,
     }
 
 
-# RECOGNITION RESULT - FIXED
+# RECOGNITION RESULT
 @router.get("/recognition-result")
 def recognition_result(
     finger_id: int,
@@ -1092,7 +994,7 @@ def recognition_result(
     session_id: int = -1,
     db: Session = Depends(get_db),
 ):
-    # FIX: If no session_id provided, try to find an active session for this device
+    # If no session_id provided, try to find an active session for this device
     if session_id == -1:
         current_session = ws_manager.recognition_sessions.get(device_id)
         if current_session is not None:
@@ -1268,7 +1170,6 @@ async def clear_all_pending(
         u.finger_id = None
         u.enroll_status = EnrollmentStep.NOT_ENROLLED
         u.status = FingerprintStatus.NOT_ENROLLED
-        u.claimed_by_device = None
         u.target_device = None
 
     devices = get_all_device_states(db)
@@ -1312,7 +1213,6 @@ def debug_all_enrolled(db: Session = Depends(get_db)):
             "status": u.status.value,
             "enroll_status": u.enroll_status.value if u.enroll_status else None,
             "target_device": u.target_device,
-            "claimed_by_device": u.claimed_by_device,
         }
         for u in users
     ]
@@ -1350,7 +1250,6 @@ def debug_device_state(db: Session = Depends(get_db)):
                 "finger_id": u.finger_id,
                 "status": u.status.value,
                 "enroll_status": u.enroll_status.value if u.enroll_status else None,
-                "claimed_by_device": u.claimed_by_device,
                 "target_device": u.target_device,
             }
             for u in pending_users
@@ -1368,7 +1267,6 @@ def get_pending_enrollments(db: Session = Depends(get_db)):
             "name": f"{u.first_name} {u.last_name}",
             "finger_id": u.finger_id,
             "enroll_status": u.enroll_status.value if u.enroll_status else None,
-            "claimed_by_device": u.claimed_by_device,
             "target_device": u.target_device,
         }
         for u in users
@@ -1388,7 +1286,6 @@ async def clear_pending_enrollments(db: Session = Depends(get_db)):
         u.finger_id = None
         u.enroll_status = EnrollmentStep.NOT_ENROLLED
         u.status = FingerprintStatus.NOT_ENROLLED
-        u.claimed_by_device = None
         u.target_device = None
 
     for d in get_all_device_states(db):
