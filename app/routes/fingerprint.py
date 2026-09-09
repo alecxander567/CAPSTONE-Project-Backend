@@ -1388,3 +1388,32 @@ async def clear_pending_enrollments(db: Session = Depends(get_db)):
 @router.get("/ping")
 def ping():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+
+# GET RECOGNITION SESSION - NEW ENDPOINT
+@router.get("/recognition-session")
+def get_recognition_session(
+    device_id: str = DEFAULT_DEVICE_ID,
+    db: Session = Depends(get_db),
+):
+    """Get the current recognition session ID and target finger for a device"""
+    state = get_device_state(db, device_id)
+
+    # Check if this device is in recognize mode
+    if state.mode == "recognize":
+        # Get the session from the websocket manager
+        session_id = ws_manager.recognition_sessions.get(device_id)
+        if session_id is not None:
+            return {
+                "session_id": session_id,
+                "target_finger_id": state.recognition_target_id,
+                "mode": state.mode,
+                "is_active": True,
+            }
+
+    return {
+        "session_id": -1,
+        "target_finger_id": None,
+        "mode": state.mode,
+        "is_active": False,
+    }
