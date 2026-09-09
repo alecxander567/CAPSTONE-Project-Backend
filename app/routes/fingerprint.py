@@ -285,7 +285,7 @@ def get_target_device_endpoint(db: Session = Depends(get_db)):
         return {"target_device": None, "is_set": False, "is_online": False}
 
 
-# START ENROLLMENT
+# START ENROLLMENT - FIXED
 @router.post("/start-enrollment")
 async def start_enrollment(
     request: EnrollmentRequest,
@@ -348,14 +348,6 @@ async def start_enrollment(
     user.finger_id = finger_id
     user.enroll_status = EnrollmentStep.PENDING
     user.status = FingerprintStatus.PENDING
-    # NOTE: when target_device is None here (broadcast / "ANY device"
-    # enrollment), user.target_device is intentionally left unset for
-    # now. We don't yet know which physical device will actually claim
-    # and complete this enrollment — that's recorded in
-    # claimed_by_device by check-enrollment once a device picks it up.
-    # update_enrollment copies claimed_by_device into target_device on
-    # success, which is the only point where we actually know which
-    # sensor now holds the template.
     user.target_device = target_device
 
     try:
@@ -365,10 +357,11 @@ async def start_enrollment(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+    # FIX: Use await instead of schedule
     if target_device:
-        ws_manager.schedule(ws_manager.send_mode_update(target_device, "enroll"))
+        await ws_manager.send_mode_update(target_device, "enroll")
     else:
-        ws_manager.schedule(ws_manager.broadcast_mode("enroll"))
+        await ws_manager.broadcast_mode("enroll")
 
     return {
         "message": "Enrollment started",
@@ -379,14 +372,14 @@ async def start_enrollment(
     }
 
 
-# CHECK ENROLLMENT
+# CHECK ENROLLMENT - FIXED
 _last_check_enrollment_result = None
 _last_check_enrollment_time = 0
 _CHECK_ENROLLMENT_CACHE_MS = 100
 
 
 @router.get("/check-enrollment")
-def check_enrollment(
+async def check_enrollment(  # Made async
     req: Request,
     device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
@@ -480,16 +473,17 @@ def check_enrollment(
             )
             state.mode = "idle"
             db.commit()
-            ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
+            # FIX: Use await
+            await ws_manager.send_mode_update(device_id, "idle")
 
     _last_check_enrollment_result = None
     _last_check_enrollment_time = current_time
     return PlainTextResponse("none")
 
 
-# UPDATE ENROLLMENT
+# UPDATE ENROLLMENT - FIXED
 @router.get("/update-enrollment")
-def update_enrollment(
+async def update_enrollment(  # Made async
     req: Request,
     id: int,
     status: str,
@@ -582,24 +576,6 @@ def update_enrollment(
         user.enroll_status = enroll_step
         user.status = fingerprint_status
 
-        # FIX: the fingerprint template physically lives on whichever
-        # device actually performed the enrollment scan — that's
-        # claimed_by_device, set by check-enrollment the moment a real
-        # ESP32 picked up this pending user. This is true whether the
-        # enrollment was targeted at a specific device OR broadcast to
-        # "ANY device" (in the broadcast case, target_device is None
-        # until this exact point — claimed_by_device is the only record
-        # of which physical sensor actually did it).
-        #
-        # On success: copy claimed_by_device into target_device (only if
-        # target_device isn't already set, which covers the "ANY device"
-        # broadcast case) so future recognition attempts always go back
-        # to the same physical sensor that holds the template. Then
-        # clear claimed_by_device — it's just the transient claim lock
-        # used during the enrollment handshake and has no further use.
-        #
-        # On error: nothing was actually stored on any sensor, so there
-        # is no device binding to preserve — clear both.
         if status == "success":
             if not user.target_device:
                 user.target_device = user.claimed_by_device
@@ -614,9 +590,10 @@ def update_enrollment(
         db.rollback()
         return PlainTextResponse("error")
 
+    # FIX: Use await
     if status in ["success", "error", "delete_success", "delete_error"]:
         set_mode_on_all_devices(db, "idle")
-        ws_manager.schedule(ws_manager.broadcast_mode("idle"))
+        await ws_manager.broadcast_mode("idle")
 
     return PlainTextResponse("updated")
 
@@ -652,7 +629,7 @@ def get_status(
     }
 
 
-# RESET ENROLLMENT
+# RESET ENROLLMENT - FIXED
 @router.post("/reset-enrollment/{user_id}")
 async def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
     client_ip = req.client.host
@@ -675,7 +652,8 @@ async def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get
     user.target_device = None
 
     set_mode_on_all_devices(db, "idle")
-    ws_manager.schedule(ws_manager.broadcast_mode("idle"))
+    # FIX: Use await
+    await ws_manager.broadcast_mode("idle")
 
     try:
         db.commit()
@@ -686,7 +664,7 @@ async def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get
     return {"message": "Enrollment reset successfully"}
 
 
-# CANCEL OPERATION
+# CANCEL OPERATION - FIXED
 @router.post("/cancel-operation")
 async def cancel_operation(db: Session = Depends(get_db)):
     log_request("CANCEL-OPERATION", "dashboard")
@@ -719,12 +697,13 @@ async def cancel_operation(db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    ws_manager.schedule(ws_manager.broadcast_mode("idle"))
+    # FIX: Use await
+    await ws_manager.broadcast_mode("idle")
 
     return {"message": "All devices reset to idle; operation cancelled"}
 
 
-# UNENROLL FINGERPRINT
+# UNENROLL FINGERPRINT - FIXED
 @router.post("/unenroll-fingerprint/{user_id}")
 async def unenroll_fingerprint(
     user_id: int, req: Request, db: Session = Depends(get_db)
@@ -762,19 +741,20 @@ async def unenroll_fingerprint(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    ws_manager.schedule(ws_manager.broadcast_mode("delete"))
+    # FIX: Use await
+    await ws_manager.broadcast_mode("delete")
 
     return {"message": "Unenrollment started", "finger_id": user.finger_id}
 
 
-# CHECK DELETE
+# CHECK DELETE - FIXED
 _last_check_delete_result = None
 _last_check_delete_time = 0
 _CHECK_DELETE_CACHE_MS = 100
 
 
 @router.get("/check-delete")
-def check_delete(
+async def check_delete(  # Made async
     req: Request,
     device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
@@ -807,7 +787,8 @@ def check_delete(
             state.pending_delete_updated_at = None
             state.mode = "idle"
             db.commit()
-            ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
+            # FIX: Use await
+            await ws_manager.send_mode_update(device_id, "idle")
             _last_check_delete_result = None
             _last_check_delete_time = current_time
             return PlainTextResponse("none")
@@ -831,7 +812,8 @@ def check_delete(
         )
         state.mode = "idle"
         db.commit()
-        ws_manager.schedule(ws_manager.send_mode_update(device_id, "idle"))
+        # FIX: Use await
+        await ws_manager.send_mode_update(device_id, "idle")
 
     _last_check_delete_result = None
     _last_check_delete_time = current_time
@@ -845,7 +827,7 @@ def device_status(db: Session = Depends(get_db)):
     return {"connected": connected}
 
 
-# START ATTENDANCE
+# START ATTENDANCE - FIXED
 @router.post("/start-attendance")
 async def start_attendance(
     request: StartAttendanceRequest,
@@ -861,12 +843,13 @@ async def start_attendance(
     set_mode_on_all_devices(db, "attendance")
     set_active_event_on_all_devices(db, request.event_id)
 
-    ws_manager.schedule(ws_manager.broadcast_mode("attendance"))
+    # FIX: Use await
+    await ws_manager.broadcast_mode("attendance")
 
     return {"message": "Attendance mode started", "event_id": request.event_id}
 
 
-# STOP ATTENDANCE
+# STOP ATTENDANCE - FIXED
 @router.post("/stop-attendance")
 async def stop_attendance(db: Session = Depends(get_db)):
     print("[ATTENDANCE] Stopping attendance")
@@ -874,7 +857,8 @@ async def stop_attendance(db: Session = Depends(get_db)):
     set_mode_on_all_devices(db, "idle")
     set_active_event_on_all_devices(db, None)
 
-    ws_manager.schedule(ws_manager.broadcast_mode("idle"))
+    # FIX: Use await
+    await ws_manager.broadcast_mode("idle")
 
     return {"message": "Attendance mode stopped"}
 
@@ -988,7 +972,7 @@ def get_device_mode(
     return PlainTextResponse(mode)
 
 
-# START RECOGNITION
+# START RECOGNITION - FIXED
 @router.post("/start-recognition/{user_id}")
 async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
@@ -1015,14 +999,6 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     print("[RECOGNIZE] Cleared all existing recognition state from all devices")
 
     # Determine which device should handle recognition.
-    # IMPORTANT: user.target_device is checked FIRST because it now
-    # persists after a successful enrollment (see update_enrollment) and
-    # records which physical sensor actually holds this fingerprint
-    # template — whether the enrollment was targeted at a specific
-    # device or broadcast to "ANY device". Recognition can only ever
-    # succeed against that same physical device, so this must take
-    # priority over the system-wide target device or "first online
-    # device" fallbacks below.
     target_device = None
 
     if user.target_device:
@@ -1072,7 +1048,8 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-    ws_manager.schedule(ws_manager.send_recognize_command(target_device, session_id))
+    # FIX: Use await
+    await ws_manager.send_recognize_command(target_device, session_id)
 
     return {
         "message": f"Recognition test started on device {target_device}",
@@ -1083,7 +1060,7 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     }
 
 
-# RECOGNITION RESULT - FIXED
+# RECOGNITION RESULT
 @router.get("/recognition-result")
 def recognition_result(
     finger_id: int,
@@ -1092,7 +1069,6 @@ def recognition_result(
     session_id: int = -1,
     db: Session = Depends(get_db),
 ):
-    # FIX: If no session_id provided, try to find an active session for this device
     if session_id == -1:
         current_session = ws_manager.recognition_sessions.get(device_id)
         if current_session is not None:
@@ -1105,7 +1081,6 @@ def recognition_result(
                 f"[RECOGNIZE] Device {device_id} posted result without session_id - HTTP fallback"
             )
 
-    # Validate session if we have one
     if session_id != -1:
         current_session = ws_manager.recognition_sessions.get(device_id)
         if current_session is not None and session_id != current_session:
@@ -1168,7 +1143,6 @@ def get_recognition_result(
 ):
     state = get_device_state(db, device_id)
 
-    # Auto-clear stale results
     if state.recognition_matched is not None:
         current_session = ws_manager.recognition_sessions.get(device_id)
 
@@ -1251,7 +1225,7 @@ async def cancel_recognition(
     return {"message": "Recognition state cleared successfully"}
 
 
-# CLEAR ALL PENDING ENROLLMENTS
+# CLEAR ALL PENDING ENROLLMENTS - FIXED
 @router.post("/clear-all-pending")
 async def clear_all_pending(
     db: Session = Depends(get_db),
@@ -1291,7 +1265,8 @@ async def clear_all_pending(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    ws_manager.schedule(ws_manager.broadcast_mode("idle"))
+    # FIX: Use await
+    await ws_manager.broadcast_mode("idle")
 
     return {
         "message": f"Cleared {cleared_count} pending enrollment(s) and all recognition state",
@@ -1401,7 +1376,8 @@ async def clear_pending_enrollments(db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    ws_manager.schedule(ws_manager.broadcast_mode("idle"))
+    # FIX: Use await
+    await ws_manager.broadcast_mode("idle")
 
     return {
         "message": f"Cleared {len(pending_users)} pending enrollment(s)",
