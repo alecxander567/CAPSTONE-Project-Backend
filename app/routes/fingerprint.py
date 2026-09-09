@@ -574,7 +574,25 @@ def update_enrollment(
         user.enroll_status = enroll_step
         user.status = fingerprint_status
 
-        if status in ("success", "error"):
+        # FIX: previously both claimed_by_device AND target_device were
+        # wiped on every terminal status (success or error). That's wrong
+        # for "success" — the fingerprint template now physically lives
+        # on this device's sensor flash, and recognition can ONLY work
+        # against the same physical sensor. Wiping target_device here
+        # lost that binding, so later recognition attempts fell back to
+        # the system-wide target device (or "first online device"),
+        # which could be a different physical ESP32 than the one the
+        # student actually enrolled on — causing recognition to target
+        # the wrong device and get stuck forever at "place finger"
+        # because no one is standing in front of THAT sensor.
+        #
+        # claimed_by_device is just the transient lock used during the
+        # enrollment handshake and is always safe to clear. target_device
+        # should only be cleared when there's no template to bind to
+        # anymore (enrollment failed, or later, on actual deletion).
+        if status == "success":
+            user.claimed_by_device = None
+        elif status == "error":
             user.claimed_by_device = None
             user.target_device = None
 
@@ -984,7 +1002,13 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     db.commit()
     print("[RECOGNIZE] Cleared all existing recognition state from all devices")
 
-    # Determine which device should handle recognition
+    # Determine which device should handle recognition.
+    # IMPORTANT: user.target_device is checked FIRST because it now
+    # persists after a successful enrollment (see update_enrollment) and
+    # records which physical sensor actually holds this fingerprint
+    # template. Recognition can only ever succeed against that same
+    # physical device, so this must take priority over the system-wide
+    # target device or "first online device" fallbacks below.
     target_device = None
 
     if user.target_device:
