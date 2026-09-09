@@ -8,6 +8,7 @@ from app.models.device import DeviceState
 DEFAULT_DEVICE_ID = "esp32-default"
 DEVICE_STALE_SECONDS = 15
 MODE_STALE_SECONDS = 25
+RECOGNIZE_STALE_SECONDS = 45
 
 
 def get_device_state(db: Session, device_id: str = DEFAULT_DEVICE_ID) -> DeviceState:
@@ -142,7 +143,9 @@ def heal_stale_device_modes(db: Session) -> int:
 
     now = datetime.utcnow()
     cutoff = now - timedelta(seconds=MODE_STALE_SECONDS)
+    recognize_cutoff = now - timedelta(seconds=RECOGNIZE_STALE_SECONDS)
     healed = 0
+    healed_recognize_devices: List[str] = []
 
     for state in get_all_device_states(db):
         if state.mode == "idle":
@@ -152,12 +155,18 @@ def heal_stale_device_modes(db: Session) -> int:
         if state.mode == "attendance":
             continue
 
-        # DO NOT reset devices in recognize mode
         if state.mode == "recognize":
-            continue
-
-        if state.mode_updated_at and state.mode_updated_at >= cutoff:
-            continue
+            # Recognition has its own (shorter) staleness window, based on
+            # whichever timestamp is most recent: when the result last
+            # updated, or when the mode was last set. This prevents a
+            # device from being stuck in "recognize" indefinitely if the
+            # frontend stopped polling before consuming the result.
+            ref_time = state.recognition_updated_at or state.mode_updated_at
+            if ref_time and ref_time >= recognize_cutoff:
+                continue
+        else:
+            if state.mode_updated_at and state.mode_updated_at >= cutoff:
+                continue
 
         stuck_mode = state.mode
         state.mode = "idle"
@@ -186,6 +195,19 @@ def heal_stale_device_modes(db: Session) -> int:
                 u.claimed_by_device = None
                 u.target_device = None
 
+        if stuck_mode == "recognize":
+            healed_recognize_devices.append(state.device_id)
+
     if healed:
         db.commit()
+
+    # Invalidate any lingering WS recognition sessions for devices we just
+    # healed out of recognize mode, so a late ESP32 result gets ignored
+    # as stale instead of resurrecting the old session.
+    if healed_recognize_devices:
+        from app.routes.fingerprint import ws_manager
+
+        for device_id in healed_recognize_devices:
+            ws_manager.invalidate_recognition_session(device_id)
+
     return healed
