@@ -348,6 +348,14 @@ async def start_enrollment(
     user.finger_id = finger_id
     user.enroll_status = EnrollmentStep.PENDING
     user.status = FingerprintStatus.PENDING
+    # NOTE: when target_device is None here (broadcast / "ANY device"
+    # enrollment), user.target_device is intentionally left unset for
+    # now. We don't yet know which physical device will actually claim
+    # and complete this enrollment — that's recorded in
+    # claimed_by_device by check-enrollment once a device picks it up.
+    # update_enrollment copies claimed_by_device into target_device on
+    # success, which is the only point where we actually know which
+    # sensor now holds the template.
     user.target_device = target_device
 
     try:
@@ -574,23 +582,27 @@ def update_enrollment(
         user.enroll_status = enroll_step
         user.status = fingerprint_status
 
-        # FIX: previously both claimed_by_device AND target_device were
-        # wiped on every terminal status (success or error). That's wrong
-        # for "success" — the fingerprint template now physically lives
-        # on this device's sensor flash, and recognition can ONLY work
-        # against the same physical sensor. Wiping target_device here
-        # lost that binding, so later recognition attempts fell back to
-        # the system-wide target device (or "first online device"),
-        # which could be a different physical ESP32 than the one the
-        # student actually enrolled on — causing recognition to target
-        # the wrong device and get stuck forever at "place finger"
-        # because no one is standing in front of THAT sensor.
+        # FIX: the fingerprint template physically lives on whichever
+        # device actually performed the enrollment scan — that's
+        # claimed_by_device, set by check-enrollment the moment a real
+        # ESP32 picked up this pending user. This is true whether the
+        # enrollment was targeted at a specific device OR broadcast to
+        # "ANY device" (in the broadcast case, target_device is None
+        # until this exact point — claimed_by_device is the only record
+        # of which physical sensor actually did it).
         #
-        # claimed_by_device is just the transient lock used during the
-        # enrollment handshake and is always safe to clear. target_device
-        # should only be cleared when there's no template to bind to
-        # anymore (enrollment failed, or later, on actual deletion).
+        # On success: copy claimed_by_device into target_device (only if
+        # target_device isn't already set, which covers the "ANY device"
+        # broadcast case) so future recognition attempts always go back
+        # to the same physical sensor that holds the template. Then
+        # clear claimed_by_device — it's just the transient claim lock
+        # used during the enrollment handshake and has no further use.
+        #
+        # On error: nothing was actually stored on any sensor, so there
+        # is no device binding to preserve — clear both.
         if status == "success":
+            if not user.target_device:
+                user.target_device = user.claimed_by_device
             user.claimed_by_device = None
         elif status == "error":
             user.claimed_by_device = None
@@ -1006,9 +1018,11 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     # IMPORTANT: user.target_device is checked FIRST because it now
     # persists after a successful enrollment (see update_enrollment) and
     # records which physical sensor actually holds this fingerprint
-    # template. Recognition can only ever succeed against that same
-    # physical device, so this must take priority over the system-wide
-    # target device or "first online device" fallbacks below.
+    # template — whether the enrollment was targeted at a specific
+    # device or broadcast to "ANY device". Recognition can only ever
+    # succeed against that same physical device, so this must take
+    # priority over the system-wide target device or "first online
+    # device" fallbacks below.
     target_device = None
 
     if user.target_device:
