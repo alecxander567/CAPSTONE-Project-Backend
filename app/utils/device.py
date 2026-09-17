@@ -6,7 +6,17 @@ from sqlalchemy.orm import Session
 from app.models.device import DeviceState
 
 DEFAULT_DEVICE_ID = "esp32-default"
-DEVICE_STALE_SECONDS = 15
+
+# FIX: Widened from 15s to 40s. The ESP32 firmware sends a heartbeat every
+# 10s (HEARTBEAT_MS) with a 5s HTTP timeout, and also polls /device-mode
+# every 3s. On a backend with any network jitter or cold-start latency
+# (e.g. Render free tier), a single dropped/slow heartbeat can easily eat
+# more than 15s of the staleness window, causing a fully-functional device
+# to be falsely reported as "offline" even while it's actively completing
+# HTTP round trips. 40s gives multiple heartbeat/poll cycles worth of
+# slack before we conclude the device is actually gone.
+DEVICE_STALE_SECONDS = 40
+
 MODE_STALE_SECONDS = 25
 RECOGNIZE_STALE_SECONDS = 45
 

@@ -65,6 +65,15 @@ def log_request(endpoint: str, client_ip: str, extra: str = ""):
     print(f"[{timestamp}] {endpoint} | {client_ip} {extra}")
 
 
+# FIX: Small shared helper so any endpoint that receives a real request
+# from a device can bump last_seen without duplicating the two lines
+# everywhere. Only call this from endpoints that are actually hit by the
+# ESP32 firmware itself (not from dashboard/admin endpoints), otherwise a
+# human refreshing a status page could make a dead device look alive.
+def touch_last_seen(db: Session, state: DeviceState) -> None:
+    state.last_seen = datetime.utcnow()
+
+
 def _finger_ids_in_flight(db: Session) -> set[int]:
     now = datetime.utcnow()
     stale_cutoff = now - timedelta(seconds=PENDING_DELETE_TIMEOUT_SECONDS)
@@ -418,6 +427,9 @@ async def check_enrollment(
             return PlainTextResponse(str(_last_check_enrollment_result))
 
     state = get_device_state(db, device_id)
+    # FIX: this endpoint is polled by the ESP32 every ENROLL_POLL_MS (200ms)
+    # while in enroll mode, and is a genuine device heartbeat signal.
+    touch_last_seen(db, state)
 
     # Find a pending user that hasn't been claimed yet
     user = (
@@ -434,6 +446,7 @@ async def check_enrollment(
         if user.target_device and user.target_device != device_id:
             _last_check_enrollment_result = None
             _last_check_enrollment_time = current_time
+            db.commit()
             return PlainTextResponse("none")
 
         user.claimed_by_device = device_id
@@ -486,6 +499,7 @@ async def check_enrollment(
         )
         _last_check_enrollment_result = user.finger_id
         _last_check_enrollment_time = current_time
+        db.commit()
         return PlainTextResponse(str(user.finger_id))
 
     if state.mode == "enroll":
@@ -509,6 +523,7 @@ async def check_enrollment(
 
     _last_check_enrollment_result = None
     _last_check_enrollment_time = current_time
+    db.commit()
     return PlainTextResponse("none")
 
 
@@ -528,11 +543,17 @@ async def update_enrollment(
         f"| finger_id={id} | status={status} | device={device_id}",
     )
 
+    # FIX: device is actively mid-enrollment when calling this; count it as seen.
+    state = get_device_state(db, device_id)
+    touch_last_seen(db, state)
+
     if id == 0:
+        db.commit()
         return PlainTextResponse("invalid_id")
 
     user = db.query(User).filter(User.finger_id == id).first()
     if not user:
+        db.commit()
         return PlainTextResponse("error")
 
     if status in ("place_finger", "remove_finger", "place_again", "success", "error"):
@@ -543,6 +564,7 @@ async def update_enrollment(
                 f"| finger_id={id} | IGNORED stale enroll callback "
                 f"(user status={user.status.value})",
             )
+            db.commit()
             return PlainTextResponse("stale_ignored")
 
     status_map = {
@@ -556,6 +578,7 @@ async def update_enrollment(
     }
 
     if status not in status_map:
+        db.commit()
         return PlainTextResponse("invalid_status")
 
     enroll_step, fingerprint_status = status_map[status]
@@ -799,6 +822,9 @@ async def check_delete(
             return PlainTextResponse(str(_last_check_delete_result))
 
     state = get_device_state(db, device_id)
+    # FIX: polled every DELETE_POLL_MS (200ms) while in delete mode — a real
+    # device-presence signal.
+    touch_last_seen(db, state)
 
     if state.pending_delete_id is not None:
         now = datetime.utcnow()
@@ -845,6 +871,7 @@ async def check_delete(
 
     _last_check_delete_result = None
     _last_check_delete_time = current_time
+    db.commit()
     return PlainTextResponse("none")
 
 
@@ -902,18 +929,27 @@ def mark_attendance(
         "MARK-ATTENDANCE", client_ip, f"| device={device_id} | finger_id={finger_id}"
     )
 
+    # FIX: a device only calls this when it just matched a finger during
+    # attendance mode — unambiguous proof of life.
+    _state_for_seen = get_device_state(db, device_id)
+    touch_last_seen(db, _state_for_seen)
+
     user = db.query(User).filter(User.finger_id == finger_id).first()
     if not user:
+        db.commit()
         return PlainTextResponse("user_not_found")
     if user.status != FingerprintStatus.ENROLLED:
+        db.commit()
         return PlainTextResponse("not_enrolled")
 
     state = get_device_state(db, device_id)
     if not state.active_event_id:
+        db.commit()
         return PlainTextResponse("no_active_event")
 
     ongoing_event = db.query(Event).filter(Event.id == state.active_event_id).first()
     if not ongoing_event:
+        db.commit()
         return PlainTextResponse("no_active_event")
 
     ph_tz_local = pytz.timezone("Asia/Manila")
@@ -930,10 +966,12 @@ def mark_attendance(
             client_ip,
             f"| device={device_id} | finger_id={finger_id} | event not in progress",
         )
+        db.commit()
         return PlainTextResponse("event_not_active")
 
     if ongoing_event.program_id is not None:
         if user.program_id != ongoing_event.program_id:
+            db.commit()
             return PlainTextResponse("wrong_program")
 
     new_attendance = Attendance(
@@ -988,13 +1026,29 @@ def get_device_mode(
     if cache_key in _mode_cache:
         cached_time, cached_mode = _mode_cache[cache_key]
         if time.time() - cached_time < 0.5:
+            # FIX: still update last_seen even on the fast-path cache hit —
+            # the device genuinely made a request just now, it just got
+            # served from cache instead of hitting the DB for the mode
+            # value. This is the single most important fix: /device-mode is
+            # polled every 3s (HTTP_FALLBACK_MS) by BOTH devices regardless
+            # of WebSocket state, so it's by far the most reliable presence
+            # signal available, and previously it updated nothing at all.
+            state = get_device_state(db, device_id)
+            touch_last_seen(db, state)
+            db.commit()
             return PlainTextResponse(cached_mode)
 
     state = get_device_state(db, device_id)
     mode = state.mode
 
+    # FIX: see comment above — this is the main fix for false "offline"
+    # reports. Every 3s poll now counts as proof of life, independent of
+    # WebSocket connectivity and independent of the 10s heartbeat cadence.
+    touch_last_seen(db, state)
+
     _mode_cache[cache_key] = (time.time(), mode)
 
+    db.commit()
     return PlainTextResponse(mode)
 
 
@@ -1006,12 +1060,15 @@ def get_recognition_session(
 ):
     """Get the current recognition session ID and target finger for a device"""
     state = get_device_state(db, device_id)
+    # FIX: device calls this right after entering recognize mode — proof of life.
+    touch_last_seen(db, state)
 
     # Check if this device is in recognize mode
     if state.mode == "recognize":
         # Get the session from the websocket manager
         session_id = ws_manager.recognition_sessions.get(device_id)
         if session_id is not None:
+            db.commit()
             return {
                 "session_id": session_id,
                 "target_finger_id": state.recognition_target_id,
@@ -1019,6 +1076,7 @@ def get_recognition_session(
                 "is_active": True,
             }
 
+    db.commit()
     return {
         "session_id": -1,
         "target_finger_id": None,
@@ -1137,6 +1195,10 @@ def recognition_result(
     session_id: int = -1,
     db: Session = Depends(get_db),
 ):
+    # FIX: device just finished a scan and is reporting the result — proof of life.
+    _state_for_seen = get_device_state(db, device_id)
+    touch_last_seen(db, _state_for_seen)
+
     if session_id == -1:
         current_session = ws_manager.recognition_sessions.get(device_id)
         if current_session is not None:
@@ -1156,18 +1218,21 @@ def recognition_result(
                 f"[RECOGNIZE] Device {device_id} posted stale/mismatched session "
                 f"(got={session_id}, expected={current_session}) — ignored"
             )
+            db.commit()
             return PlainTextResponse("stale_ignored")
 
     state = get_device_state(db, device_id)
 
     if state.recognition_target_id is None:
         print(f"[RECOGNIZE] Device {device_id} has no active recognition target")
+        db.commit()
         return PlainTextResponse("no_active_recognition")
 
     if state.mode != "recognize":
         print(
             f"[RECOGNIZE] Device {device_id} is not in recognize mode (mode={state.mode})"
         )
+        db.commit()
         return PlainTextResponse("device_not_in_recognition_mode")
 
     print(
@@ -1190,6 +1255,7 @@ def recognition_result(
 
     if result.rowcount == 0:
         print(f"[RECOGNIZE] Device {device_id} already processed")
+        db.commit()
         return PlainTextResponse("already_processed")
 
     try:
@@ -1209,6 +1275,12 @@ def get_recognition_result(
     device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
 ):
+    # NOTE: this endpoint is polled by the FRONTEND/dashboard (to check
+    # whether a recognition attempt finished), not by the ESP32 itself —
+    # see the access log you shared, where this path is hit continuously
+    # from a browser IP. So we deliberately do NOT touch last_seen here;
+    # doing so would make a device look "online" just because someone has
+    # a dashboard tab open, which defeats the purpose of the presence check.
     state = get_device_state(db, device_id)
 
     if state.recognition_matched is not None:
