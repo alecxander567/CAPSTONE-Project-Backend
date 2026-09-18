@@ -30,9 +30,12 @@ engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
     pool_recycle=120,
-    pool_size=3,  # CHANGED — was 2
-    max_overflow=2,  # CHANGED — was 1
-    pool_timeout=15,  # CHANGED — was 30
+    pool_size=10,  # CHANGED — was 3. Prevents concurrent attendance marks
+    # (or attendance + device polling) from queuing/timing out when two
+    # scans land on esp32-1 and esp32-default at nearly the same instant.
+    max_overflow=10,  # CHANGED — was 2. Extra headroom above pool_size for
+    # bursts (e.g. dashboard open + both devices polling + a scan).
+    pool_timeout=15,
     echo=False,
     connect_args=(
         {
