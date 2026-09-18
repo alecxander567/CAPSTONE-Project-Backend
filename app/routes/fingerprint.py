@@ -65,11 +65,6 @@ def log_request(endpoint: str, client_ip: str, extra: str = ""):
     print(f"[{timestamp}] {endpoint} | {client_ip} {extra}")
 
 
-# FIX: Small shared helper so any endpoint that receives a real request
-# from a device can bump last_seen without duplicating the two lines
-# everywhere. Only call this from endpoints that are actually hit by the
-# ESP32 firmware itself (not from dashboard/admin endpoints), otherwise a
-# human refreshing a status page could make a dead device look alive.
 def touch_last_seen(db: Session, state: DeviceState) -> None:
     state.last_seen = datetime.utcnow()
 
@@ -95,6 +90,11 @@ class DeviceConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}
         self.device_modes: Dict[str, str] = {}
         self.recognition_sessions: Dict[str, Optional[int]] = {}
+        # NEW: current attendance session id, shared across all devices.
+        # The ESP32 echoes this back in mark-attendance so a stale scan
+        # from a previous attendance session can't be recorded into the
+        # current one.
+        self.attendance_session_id: Optional[int] = None
         self.loop: asyncio.AbstractEventLoop | None = None
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -186,15 +186,12 @@ class DeviceConnectionManager:
             print(f"[WS] Device {device_id} not connected")
         return False
 
-    # NEW: Send recognize command with target finger ID
     async def send_recognize_command_with_target(
         self, device_id: str, session_id: int, target_finger_id: int
     ):
-        """Send recognize command with session ID and target finger ID"""
         self.recognition_sessions[device_id] = session_id
         if device_id in self.active_connections:
             try:
-                # Send: mode:recognize:session_id:target_finger_id
                 await self.active_connections[device_id].send_text(
                     f"mode:recognize:{session_id}:{target_finger_id}"
                 )
@@ -247,7 +244,6 @@ async def websocket_endpoint(websocket: WebSocket, device_id: str):
         ws_manager.disconnect(device_id)
 
 
-# WEBSOCKET STATUS ENDPOINT - FOR DEBUGGING
 @router.get("/ws-status")
 def ws_status():
     return {
@@ -257,7 +253,6 @@ def ws_status():
     }
 
 
-# Get online devices for admin selection
 @router.get("/online-devices")
 def get_online_devices_endpoint(db: Session = Depends(get_db)):
     devices = get_all_device_states(db)
@@ -275,7 +270,6 @@ def get_online_devices_endpoint(db: Session = Depends(get_db)):
     }
 
 
-# Set system-wide target device
 @router.post("/set-target-device")
 async def set_target_device_endpoint(
     request: DeviceSelectionRequest, db: Session = Depends(get_db)
@@ -295,14 +289,12 @@ async def set_target_device_endpoint(
     }
 
 
-# Clear system-wide target device
 @router.post("/clear-target-device")
 async def clear_target_device_endpoint(db: Session = Depends(get_db)):
     clear_system_target_device(db)
     return {"message": "Target device cleared - will use any available device"}
 
 
-# Get current system-wide target device
 @router.get("/target-device")
 def get_target_device_endpoint(db: Session = Depends(get_db)):
     target_device = get_system_target_device(db)
@@ -318,7 +310,7 @@ def get_target_device_endpoint(db: Session = Depends(get_db)):
         return {"target_device": None, "is_set": False, "is_online": False}
 
 
-# START ENROLLMENT - FIXED
+# ── ENROLLMENT (unchanged — WebSocket-driven) ─────────────────────────────
 @router.post("/start-enrollment")
 async def start_enrollment(
     request: EnrollmentRequest,
@@ -390,7 +382,6 @@ async def start_enrollment(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-    # Use await instead of schedule
     if target_device:
         await ws_manager.send_mode_update(target_device, "enroll")
     else:
@@ -405,7 +396,6 @@ async def start_enrollment(
     }
 
 
-# CHECK ENROLLMENT - FIXED
 _last_check_enrollment_result = None
 _last_check_enrollment_time = 0
 _CHECK_ENROLLMENT_CACHE_MS = 100
@@ -427,11 +417,8 @@ async def check_enrollment(
             return PlainTextResponse(str(_last_check_enrollment_result))
 
     state = get_device_state(db, device_id)
-    # FIX: this endpoint is polled by the ESP32 every ENROLL_POLL_MS (200ms)
-    # while in enroll mode, and is a genuine device heartbeat signal.
     touch_last_seen(db, state)
 
-    # Find a pending user that hasn't been claimed yet
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
@@ -451,7 +438,6 @@ async def check_enrollment(
 
         user.claimed_by_device = device_id
 
-        # FIX: Set target_device immediately so recognition knows which device to use
         if not user.target_device:
             user.target_device = device_id
             print(f"[Check-Enroll] Set target_device={device_id} for user {user.id}")
@@ -473,7 +459,6 @@ async def check_enrollment(
         _last_check_enrollment_time = current_time
         return PlainTextResponse(str(user.finger_id))
 
-    # Resume an existing enrollment on this device
     user = (
         db.query(User)
         .filter(User.status == FingerprintStatus.PENDING)
@@ -527,7 +512,6 @@ async def check_enrollment(
     return PlainTextResponse("none")
 
 
-# UPDATE ENROLLMENT - FIXED
 @router.get("/update-enrollment")
 async def update_enrollment(
     req: Request,
@@ -543,7 +527,6 @@ async def update_enrollment(
         f"| finger_id={id} | status={status} | device={device_id}",
     )
 
-    # FIX: device is actively mid-enrollment when calling this; count it as seen.
     state = get_device_state(db, device_id)
     touch_last_seen(db, state)
 
@@ -630,9 +613,8 @@ async def update_enrollment(
         user.enroll_status = enroll_step
         user.status = fingerprint_status
 
-        # FIX: ALWAYS set target_device to the device that enrolled the user
         if status == "success":
-            user.target_device = device_id  # The device that sent the update
+            user.target_device = device_id
             user.claimed_by_device = None
             print(
                 f"[Enroll] User {user.id} enrolled on device {device_id}, target_device set"
@@ -652,10 +634,6 @@ async def update_enrollment(
         await ws_manager.broadcast_mode("idle")
 
     return PlainTextResponse("updated")
-
-
-# GET STATUS
-_get_status_call_count = 0
 
 
 @router.get("/get-status")
@@ -685,7 +663,9 @@ def get_status(
     }
 
 
-# RESET ENROLLMENT
+_get_status_call_count = 0
+
+
 @router.post("/reset-enrollment/{user_id}")
 async def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get_db)):
     client_ip = req.client.host
@@ -719,7 +699,6 @@ async def reset_enrollment(user_id: int, req: Request, db: Session = Depends(get
     return {"message": "Enrollment reset successfully"}
 
 
-# CANCEL OPERATION
 @router.post("/cancel-operation")
 async def cancel_operation(db: Session = Depends(get_db)):
     log_request("CANCEL-OPERATION", "dashboard")
@@ -735,6 +714,8 @@ async def cancel_operation(db: Session = Depends(get_db)):
         d.active_event_id = None
         d.target_device_id = None
         ws_manager.invalidate_recognition_session(d.device_id)
+
+    ws_manager.attendance_session_id = None
 
     pending_users = (
         db.query(User).filter(User.status == FingerprintStatus.PENDING).all()
@@ -757,7 +738,6 @@ async def cancel_operation(db: Session = Depends(get_db)):
     return {"message": "All devices reset to idle; operation cancelled"}
 
 
-# UNENROLL FINGERPRINT
 @router.post("/unenroll-fingerprint/{user_id}")
 async def unenroll_fingerprint(
     user_id: int, req: Request, db: Session = Depends(get_db)
@@ -800,7 +780,6 @@ async def unenroll_fingerprint(
     return {"message": "Unenrollment started", "finger_id": user.finger_id}
 
 
-# CHECK DELETE
 _last_check_delete_result = None
 _last_check_delete_time = 0
 _CHECK_DELETE_CACHE_MS = 100
@@ -822,8 +801,6 @@ async def check_delete(
             return PlainTextResponse(str(_last_check_delete_result))
 
     state = get_device_state(db, device_id)
-    # FIX: polled every DELETE_POLL_MS (200ms) while in delete mode — a real
-    # device-presence signal.
     touch_last_seen(db, state)
 
     if state.pending_delete_id is not None:
@@ -875,19 +852,23 @@ async def check_delete(
     return PlainTextResponse("none")
 
 
-# DEVICE STATUS
 @router.get("/device-status")
 def device_status(db: Session = Depends(get_db)):
     connected = any(is_device_online(s) for s in get_all_device_states(db))
     return {"connected": connected}
 
 
-# START ATTENDANCE
+# ── ATTENDANCE (pure polling) ─────────────────────────────────────────────
 @router.post("/start-attendance")
 async def start_attendance(
     request: StartAttendanceRequest,
     db: Session = Depends(get_db),
 ):
+    """
+    Start attendance mode. Pure polling — no WebSocket broadcast.
+    All devices are pinned to the same event and will pick it up on their
+    next /check-attendance poll.
+    """
     print(f"[ATTENDANCE] Starting attendance for event {request.event_id}")
 
     event = db.query(Event).filter(Event.id == request.event_id).first()
@@ -895,44 +876,148 @@ async def start_attendance(
         raise HTTPException(status_code=404, detail="Event not found")
 
     ensure_all_devices_free(db, "attendance")
+
+    # NEW: allocate a session id so the ESP32 can echo it back and we
+    # can reject stale scans from a previous attendance session.
+    session_id = random.randint(1, 2_147_000_000)
+    ws_manager.attendance_session_id = session_id
+
     set_mode_on_all_devices(db, "attendance")
     set_active_event_on_all_devices(db, request.event_id)
 
-    await ws_manager.broadcast_mode("attendance")
+    return {
+        "message": "Attendance mode started",
+        "event_id": request.event_id,
+        "session_id": session_id,
+    }
 
-    return {"message": "Attendance mode started", "event_id": request.event_id}
 
-
-# STOP ATTENDANCE
 @router.post("/stop-attendance")
 async def stop_attendance(db: Session = Depends(get_db)):
+    """
+    Stop attendance mode. Pure polling — no WebSocket broadcast.
+    Devices will drop back to idle on their next /check-attendance poll.
+    """
     print("[ATTENDANCE] Stopping attendance")
+
+    ws_manager.attendance_session_id = None
 
     set_mode_on_all_devices(db, "idle")
     set_active_event_on_all_devices(db, None)
 
-    await ws_manager.broadcast_mode("idle")
-
     return {"message": "Attendance mode stopped"}
 
 
-# MARK ATTENDANCE
+@router.get("/check-attendance")
+def check_attendance(
+    req: Request,
+    device_id: str = DEFAULT_DEVICE_ID,
+    db: Session = Depends(get_db),
+):
+    """
+    Polled by the ESP32 while in attendance mode.
+    Returns the active event details + session id, or {active: false}
+    when attendance has been stopped or the event is no longer valid.
+
+    Pure polling — no WebSocket is used for attendance.
+    """
+    client_ip = req.client.host
+
+    state = get_device_state(db, device_id)
+    touch_last_seen(db, state)
+
+    # Only respond with an active session if the server currently has one.
+    session_id = ws_manager.attendance_session_id
+    if session_id is None:
+        db.commit()
+        return {
+            "active": False,
+            "session_id": -1,
+            "event_id": -1,
+        }
+
+    event_id = state.active_event_id
+    if event_id is None:
+        # No event pinned → server thinks attendance is off.
+        db.commit()
+        return {
+            "active": False,
+            "session_id": -1,
+            "event_id": -1,
+        }
+
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        # Event deleted out from under us.
+        db.commit()
+        return {
+            "active": False,
+            "session_id": -1,
+            "event_id": -1,
+        }
+
+    db.commit()
+
+    return {
+        "active": True,
+        "session_id": session_id,
+        "event_id": event.id,
+        "event_title": event.title,
+        "event_date": event.event_date.isoformat() if event.event_date else None,
+        "start_time": event.start_time.isoformat() if event.start_time else None,
+        "end_time": event.end_time.isoformat() if event.end_time else None,
+        "location": event.location,
+        "program_id": event.program_id,
+    }
+
+
 @router.get("/mark-attendance")
 def mark_attendance(
     req: Request,
     finger_id: int,
     device_id: str = DEFAULT_DEVICE_ID,
+    event_id: int = -1,
+    session_id: int = -1,
     db: Session = Depends(get_db),
 ):
+    """
+    Called by the ESP32 immediately after a successful match in
+    attendance mode. The device passes the event_id + session_id it
+    received from /check-attendance, so the write is fully synchronous
+    with the scan.
+    """
     client_ip = req.client.host
     log_request(
-        "MARK-ATTENDANCE", client_ip, f"| device={device_id} | finger_id={finger_id}"
+        "MARK-ATTENDANCE",
+        client_ip,
+        f"| device={device_id} | finger_id={finger_id} "
+        f"| event_id={event_id} | session_id={session_id}",
     )
 
-    # FIX: a device only calls this when it just matched a finger during
-    # attendance mode — unambiguous proof of life.
-    _state_for_seen = get_device_state(db, device_id)
-    touch_last_seen(db, _state_for_seen)
+    state = get_device_state(db, device_id)
+    touch_last_seen(db, state)
+
+    # Session guard: if the server has rotated to a new session (or
+    # stopped attendance entirely) and the device is still echoing the
+    # old one, drop the write as stale.
+    current_session = ws_manager.attendance_session_id
+    if current_session is None:
+        db.commit()
+        return PlainTextResponse("attendance_not_active")
+    if session_id != -1 and session_id != current_session:
+        db.commit()
+        return PlainTextResponse("stale_session")
+    if session_id == -1:
+        # Fallback for older firmware that doesn't echo session_id.
+        session_id = current_session
+
+    # Resolve which event to write into.
+    # Prefer the event_id the device got from /check-attendance; fall
+    # back to the pinned active_event_id if the device didn't send one.
+    resolved_event_id = event_id if event_id != -1 else state.active_event_id
+    if resolved_event_id is None:
+        db.commit()
+        return PlainTextResponse("no_active_event")
 
     user = db.query(User).filter(User.finger_id == finger_id).first()
     if not user:
@@ -942,12 +1027,7 @@ def mark_attendance(
         db.commit()
         return PlainTextResponse("not_enrolled")
 
-    state = get_device_state(db, device_id)
-    if not state.active_event_id:
-        db.commit()
-        return PlainTextResponse("no_active_event")
-
-    ongoing_event = db.query(Event).filter(Event.id == state.active_event_id).first()
+    ongoing_event = db.query(Event).filter(Event.id == resolved_event_id).first()
     if not ongoing_event:
         db.commit()
         return PlainTextResponse("no_active_event")
@@ -1009,7 +1089,7 @@ def mark_attendance(
         return PlainTextResponse("database_error")
 
 
-# DEVICE MODE
+# ── DEVICE MODE (HTTP fallback for enroll/recognize/delete) ───────────────
 _mode_cache = {}
 _mode_cache_time = {}
 
@@ -1026,13 +1106,6 @@ def get_device_mode(
     if cache_key in _mode_cache:
         cached_time, cached_mode = _mode_cache[cache_key]
         if time.time() - cached_time < 0.5:
-            # FIX: still update last_seen even on the fast-path cache hit —
-            # the device genuinely made a request just now, it just got
-            # served from cache instead of hitting the DB for the mode
-            # value. This is the single most important fix: /device-mode is
-            # polled every 3s (HTTP_FALLBACK_MS) by BOTH devices regardless
-            # of WebSocket state, so it's by far the most reliable presence
-            # signal available, and previously it updated nothing at all.
             state = get_device_state(db, device_id)
             touch_last_seen(db, state)
             db.commit()
@@ -1041,9 +1114,6 @@ def get_device_mode(
     state = get_device_state(db, device_id)
     mode = state.mode
 
-    # FIX: see comment above — this is the main fix for false "offline"
-    # reports. Every 3s poll now counts as proof of life, independent of
-    # WebSocket connectivity and independent of the 10s heartbeat cadence.
     touch_last_seen(db, state)
 
     _mode_cache[cache_key] = (time.time(), mode)
@@ -1052,7 +1122,6 @@ def get_device_mode(
     return PlainTextResponse(mode)
 
 
-# GET RECOGNITION SESSION - NEW ENDPOINT
 @router.get("/recognition-session")
 def get_recognition_session(
     device_id: str = DEFAULT_DEVICE_ID,
@@ -1060,12 +1129,9 @@ def get_recognition_session(
 ):
     """Get the current recognition session ID and target finger for a device"""
     state = get_device_state(db, device_id)
-    # FIX: device calls this right after entering recognize mode — proof of life.
     touch_last_seen(db, state)
 
-    # Check if this device is in recognize mode
     if state.mode == "recognize":
-        # Get the session from the websocket manager
         session_id = ws_manager.recognition_sessions.get(device_id)
         if session_id is not None:
             db.commit()
@@ -1085,7 +1151,6 @@ def get_recognition_session(
     }
 
 
-# START RECOGNITION - FIXED
 @router.post("/start-recognition/{user_id}")
 async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
@@ -1096,7 +1161,6 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     if not user.finger_id:
         raise HTTPException(status_code=400, detail="User has no fingerprint")
 
-    # Clear ANY existing recognition state from ALL devices
     devices = get_all_device_states(db)
     for d in devices:
         d.recognition_target_id = None
@@ -1111,24 +1175,20 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     db.commit()
     print("[RECOGNIZE] Cleared all existing recognition state from all devices")
 
-    # FIX: ALWAYS use user.target_device first - this is the device that enrolled the user
     target_device = user.target_device
 
     if target_device:
         print(f"[RECOGNIZE] Using user's target_device: {target_device}")
     else:
-        # If no target_device, try to use system target
         target_device = get_system_target_device(db)
         if target_device:
             print(f"[RECOGNIZE] Using system target_device: {target_device}")
         else:
-            # Last resort: use first online device
             online_devices = get_online_devices(db)
             if online_devices:
                 target_device = online_devices[0].device_id
                 print(f"[RECOGNIZE] Using first online device: {target_device}")
 
-                # Update user's target_device so future recognitions use this device
                 user.target_device = target_device
                 db.commit()
             else:
@@ -1139,12 +1199,10 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
 
     state = get_device_state(db, target_device)
     if not is_device_online(state):
-        # Try to find any online device
         online_devices = get_online_devices(db)
         if online_devices:
             target_device = online_devices[0].device_id
             print(f"[RECOGNIZE] Target device offline, using: {target_device}")
-            # Update user's target_device
             user.target_device = target_device
             db.commit()
             state = get_device_state(db, target_device)
@@ -1172,7 +1230,6 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-    # FIX: Send the target finger ID to the ESP32 so it can verify the match
     await ws_manager.send_recognize_command_with_target(
         target_device, session_id, user.finger_id
     )
@@ -1186,7 +1243,6 @@ async def start_recognition(user_id: int, db: Session = Depends(get_db)):
     }
 
 
-# RECOGNITION RESULT
 @router.get("/recognition-result")
 def recognition_result(
     finger_id: int,
@@ -1195,7 +1251,6 @@ def recognition_result(
     session_id: int = -1,
     db: Session = Depends(get_db),
 ):
-    # FIX: device just finished a scan and is reporting the result — proof of life.
     _state_for_seen = get_device_state(db, device_id)
     touch_last_seen(db, _state_for_seen)
 
@@ -1268,19 +1323,12 @@ def recognition_result(
     return PlainTextResponse("ok")
 
 
-# GET RECOGNITION RESULT
 @router.get("/get-recognition-result")
 def get_recognition_result(
     finger_id: int,
     device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
 ):
-    # NOTE: this endpoint is polled by the FRONTEND/dashboard (to check
-    # whether a recognition attempt finished), not by the ESP32 itself —
-    # see the access log you shared, where this path is hit continuously
-    # from a browser IP. So we deliberately do NOT touch last_seen here;
-    # doing so would make a device look "online" just because someone has
-    # a dashboard tab open, which defeats the purpose of the presence check.
     state = get_device_state(db, device_id)
 
     if state.recognition_matched is not None:
@@ -1339,7 +1387,6 @@ def get_recognition_result(
     return {"status": "pending"}
 
 
-# CANCEL RECOGNITION
 @router.post("/cancel-recognition/{user_id}")
 async def cancel_recognition(
     user_id: int,
@@ -1365,7 +1412,6 @@ async def cancel_recognition(
     return {"message": "Recognition state cleared successfully"}
 
 
-# CLEAR ALL PENDING ENROLLMENTS
 @router.post("/clear-all-pending")
 async def clear_all_pending(
     db: Session = Depends(get_db),
@@ -1397,7 +1443,10 @@ async def clear_all_pending(
         d.recognition_matched = None
         d.recognition_updated_at = None
         d.target_device_id = None
+        d.active_event_id = None
         ws_manager.invalidate_recognition_session(d.device_id)
+
+    ws_manager.attendance_session_id = None
 
     try:
         db.commit()
@@ -1413,7 +1462,6 @@ async def clear_all_pending(
     }
 
 
-# DEBUG ENDPOINTS
 @router.get("/debug/all-enrolled")
 def debug_all_enrolled(db: Session = Depends(get_db)):
     users = db.query(User).filter(User.status == FingerprintStatus.ENROLLED).all()
@@ -1469,6 +1517,7 @@ def debug_device_state(db: Session = Depends(get_db)):
             }
             for u in pending_users
         ],
+        "attendance_session_id": ws_manager.attendance_session_id,
     }
 
 

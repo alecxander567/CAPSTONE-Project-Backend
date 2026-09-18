@@ -7,18 +7,13 @@ from app.models.device import DeviceState
 
 DEFAULT_DEVICE_ID = "esp32-default"
 
-# FIX: Widened from 15s to 40s. The ESP32 firmware sends a heartbeat every
-# 10s (HEARTBEAT_MS) with a 5s HTTP timeout, and also polls /device-mode
-# every 3s. On a backend with any network jitter or cold-start latency
-# (e.g. Render free tier), a single dropped/slow heartbeat can easily eat
-# more than 15s of the staleness window, causing a fully-functional device
-# to be falsely reported as "offline" even while it's actively completing
-# HTTP round trips. 40s gives multiple heartbeat/poll cycles worth of
-# slack before we conclude the device is actually gone.
 DEVICE_STALE_SECONDS = 40
-
 MODE_STALE_SECONDS = 25
 RECOGNIZE_STALE_SECONDS = 45
+# NEW: how long an attendance session stays "valid" server-side even if
+# the frontend forgets to call stop-attendance. Prevents a stuck session
+# from blocking a future event forever.
+ATTENDANCE_STALE_SECONDS = 60 * 60 * 8  # 8 hours
 
 
 def get_device_state(db: Session, device_id: str = DEFAULT_DEVICE_ID) -> DeviceState:
@@ -87,12 +82,10 @@ def set_active_event_on_all_devices(db: Session, event_id: int | None) -> None:
 
 def set_system_target_device(db: Session, device_id: str) -> None:
     """Set the system-wide target device for operations"""
-    # Clear previous target devices
     devices = get_all_device_states(db)
     for d in devices:
         d.target_device_id = None
 
-    # Set the new target device
     state = get_device_state(db, device_id)
     state.target_device_id = device_id
     db.commit()
@@ -124,16 +117,11 @@ MODE_LABELS = {
 def ensure_all_devices_free(
     db: Session, requested_mode: str, target_device: Optional[str] = None
 ) -> None:
-    """
-    Check if devices are free for operation.
-    If target_device is specified, only check that specific device.
-    """
     from fastapi import HTTPException
 
     devices = get_all_device_states(db)
 
     for state in devices:
-        # If target_device is specified, only check that device
         if target_device and state.device_id != target_device:
             continue
 
@@ -161,16 +149,10 @@ def heal_stale_device_modes(db: Session) -> int:
         if state.mode == "idle":
             continue
 
-        # DO NOT reset devices in attendance mode
         if state.mode == "attendance":
             continue
 
         if state.mode == "recognize":
-            # Recognition has its own (shorter) staleness window, based on
-            # whichever timestamp is most recent: when the result last
-            # updated, or when the mode was last set. This prevents a
-            # device from being stuck in "recognize" indefinitely if the
-            # frontend stopped polling before consuming the result.
             ref_time = state.recognition_updated_at or state.mode_updated_at
             if ref_time and ref_time >= recognize_cutoff:
                 continue
@@ -211,9 +193,6 @@ def heal_stale_device_modes(db: Session) -> int:
     if healed:
         db.commit()
 
-    # Invalidate any lingering WS recognition sessions for devices we just
-    # healed out of recognize mode, so a late ESP32 result gets ignored
-    # as stale instead of resurrecting the old session.
     if healed_recognize_devices:
         from app.routes.fingerprint import ws_manager
 
@@ -221,3 +200,27 @@ def heal_stale_device_modes(db: Session) -> int:
             ws_manager.invalidate_recognition_session(device_id)
 
     return healed
+
+
+# ── NEW: attendance session helpers ───────────────────────────────────────
+def get_active_attendance_event(db: Session) -> Optional[int]:
+    """
+    Return the event_id currently pinned for attendance, or None if none.
+    All devices share the same active event, so we read it from any device
+    that has active_event_id set.
+    """
+    for state in get_all_device_states(db):
+        if state.active_event_id is not None:
+            return state.active_event_id
+    return None
+
+
+def clear_attendance_on_all_devices(db: Session) -> None:
+    """Clear active_event_id and reset attendance-mode devices to idle."""
+    devices = get_all_device_states(db)
+    for d in devices:
+        d.active_event_id = None
+        if d.mode == "attendance":
+            d.mode = "idle"
+            d.mode_updated_at = datetime.utcnow()
+    db.commit()
