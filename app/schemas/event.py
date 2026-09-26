@@ -1,7 +1,18 @@
 from datetime import date, time, datetime
-from pydantic import BaseModel, field_validator
+from zoneinfo import ZoneInfo
+from pydantic import BaseModel, field_validator, model_validator
 from typing import Optional
 from app.models.events import EventStatus
+
+
+# Match the timezone used by Event.status in the model so "today" means
+# the same thing everywhere.
+APP_TIMEZONE = ZoneInfo("Asia/Manila")
+
+
+def _today() -> date:
+    """Today's date in the app's configured timezone."""
+    return datetime.now(APP_TIMEZONE).date()
 
 
 class EventBase(BaseModel):
@@ -11,24 +22,22 @@ class EventBase(BaseModel):
     start_time: time
     end_time: time
     location: str
-    program_id: Optional[int] = None  
+    program_id: Optional[int] = None
 
 
 class EventCreate(EventBase):
     @field_validator("event_date")
     @classmethod
     def event_date_must_be_future_or_today(cls, v):
-        today = date.today()
-        if v < today:
+        if v < _today():
             raise ValueError("Event date cannot be in the past")
         return v
 
-    @field_validator("end_time")
-    @classmethod
-    def end_time_must_be_after_start_time(cls, v, info):
-        if "start_time" in info.data and v <= info.data["start_time"]:
+    @model_validator(mode="after")
+    def end_time_must_be_after_start_time(self):
+        if self.end_time <= self.start_time:
             raise ValueError("End time must be after start time")
-        return v
+        return self
 
 
 class EventUpdate(BaseModel):
@@ -38,28 +47,23 @@ class EventUpdate(BaseModel):
     start_time: Optional[time] = None
     end_time: Optional[time] = None
     location: Optional[str] = None
-    program_id: Optional[int] = None 
+    program_id: Optional[int] = None
 
     @field_validator("event_date")
     @classmethod
     def update_event_date_must_be_future_or_today(cls, v):
-        if v is not None:
-            today = date.today()
-            if v < today:
-                raise ValueError("Event date cannot be in the past")
+        if v is not None and v < _today():
+            raise ValueError("Event date cannot be in the past")
         return v
 
-    @field_validator("end_time")
-    @classmethod
-    def end_time_must_be_after_start_time(cls, v, info):
-        if (
-            v is not None
-            and "start_time" in info.data
-            and info.data["start_time"] is not None
-        ):
-            if v <= info.data["start_time"]:
+    @model_validator(mode="after")
+    def end_time_must_be_after_start_time(self):
+        # Only enforce when BOTH are present in the same payload. Partial
+        # updates are validated in the route against the existing record.
+        if self.start_time is not None and self.end_time is not None:
+            if self.end_time <= self.start_time:
                 raise ValueError("End time must be after start time")
-        return v
+        return self
 
 
 class EventResponse(EventBase):
