@@ -47,8 +47,9 @@ def get_students_by_program(program_code: str, db: Session = Depends(get_db)):
             "student_id_no": s.student_id_no,
             "first_name": s.first_name,
             "last_name": s.last_name,
+            "middle_initial": s.middle_initial,  # ← NEW
             "program": program.code,
-            "email": s.email,  # ← NEW
+            "email": s.email,
             "mobile_phone": s.mobile_phone,
             "year_level": s.year_level.value if s.year_level else None,
             "fingerprint_status": s.status.value,
