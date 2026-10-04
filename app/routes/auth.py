@@ -7,7 +7,13 @@ import uuid
 
 from app.core.database import get_db
 from app.models.user import User, UserRole
-from app.schemas.user import UserCreate, UserResponse, UserLogin, UserProfileUpdate
+from app.schemas.user import (
+    UserCreate,
+    UserResponse,
+    UserLogin,
+    UserProfileUpdate,
+    AdminUserUpdate,
+)
 from app.core.security import (
     hash_password,
     verify_password,
@@ -460,3 +466,92 @@ def delete_profile_picture(
 def check_admin_exists(db: Session = Depends(get_db)):
     admin = db.query(User).filter(User.role == UserRole.ADMIN).first()
     return {"exists": bool(admin)}
+
+
+# ------------------- ADMIN: UPDATE ANY USER -------------------
+@router.patch("/admin/users/{user_id}", response_model=UserResponse)
+def admin_update_user(
+    user_id: int,
+    data: AdminUserUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Admin-only endpoint to edit another user's fields.
+    Supports student_id_no and email (the main use case), plus the
+    usual profile fields.
+    """
+    from app.models.programs import Program
+
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(
+            status_code=403, detail="Admin access required"
+        )
+
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # student_id_no — unique, and it's what the user logs in with
+    if data.student_id_no is not None:
+        cleaned_id = data.student_id_no.strip()
+        if cleaned_id == "":
+            raise HTTPException(
+                status_code=400, detail="Student ID cannot be empty"
+            )
+        existing = (
+            db.query(User)
+            .filter(User.student_id_no == cleaned_id, User.id != user_id)
+            .first()
+        )
+        if existing:
+            raise HTTPException(
+                status_code=400, detail="Student ID already registered"
+            )
+        target.student_id_no = cleaned_id
+
+    # email — unique, used for password reset
+    if data.email is not None:
+        cleaned_email = data.email.strip().lower()
+        existing = (
+            db.query(User)
+            .filter(User.email == cleaned_email, User.id != user_id)
+            .first()
+        )
+        if existing:
+            raise HTTPException(status_code=400, detail="Email already in use")
+        target.email = cleaned_email
+
+    # names
+    if data.first_name is not None:
+        target.first_name = data.first_name
+    if data.last_name is not None:
+        target.last_name = data.last_name
+    if data.middle_initial is not None:
+        target.middle_initial = data.middle_initial
+
+    # program / year_level — only meaningful for students
+    if target.role == UserRole.STUDENT:
+        if data.program is not None:
+            program = (
+                db.query(Program).filter(Program.code == data.program).first()
+            )
+            if not program:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Program '{data.program}' not found",
+                )
+            target.program_id = program.id
+
+        if data.year_level is not None:
+            normalized = YEAR_LEVEL_MAP.get(data.year_level.upper())
+            if normalized is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid year level: '{data.year_level}'",
+                )
+            target.year_level = normalized
+
+    db.commit()
+    db.refresh(target)
+    return target

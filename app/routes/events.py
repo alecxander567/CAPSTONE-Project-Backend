@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Path, Body, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import extract
+from sqlalchemy import extract, func
 from typing import List
 
 from app.core.database import get_db
@@ -16,6 +16,11 @@ from app.schemas.event import _today
 router = APIRouter(prefix="/events", tags=["Events"])
 
 
+def _normalize_title(title: str) -> str:
+    """Trim + collapse internal whitespace + lowercase for comparisons."""
+    return " ".join(title.strip().split()).lower()
+
+
 # ------------------- ADDING OF EVENTS (ADMIN ONLY) -------------------
 @router.post("/", response_model=EventResponse, status_code=201)
 def create_event(
@@ -26,8 +31,21 @@ def create_event(
     if current_user.role != "admin":
         raise HTTPException(403, "Only admins can create events")
 
+    # ── Duplicate title check (case-insensitive, whitespace-normalized) ──
+    normalized = _normalize_title(event.title)
+    existing = (
+        db.query(Event)
+        .filter(func.lower(func.trim(Event.title)) == normalized)
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"An event titled '{existing.title}' already exists.",
+        )
+
     new_event = Event(
-        title=event.title,
+        title=event.title.strip(),
         description=event.description,
         event_date=event.event_date,
         start_time=event.start_time,
@@ -85,6 +103,23 @@ def update_event(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Event not found",
         )
+
+    # ── Duplicate title check (skip if the title isn't being changed) ──
+    if event.title is not None:
+        normalized = _normalize_title(event.title)
+        clashing = (
+            db.query(Event)
+            .filter(
+                func.lower(func.trim(Event.title)) == normalized,
+                Event.id != event_id,
+            )
+            .first()
+        )
+        if clashing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"An event titled '{clashing.title}' already exists.",
+            )
 
     update_data = event.model_dump(exclude_unset=True)
 
