@@ -15,7 +15,7 @@ import random
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from app.models.attendance import Attendance, AttendanceStatus
-from app.models.events import Event
+from app.models.events import Event, EventDay
 from app.models.device import DeviceState
 from app.utils.device import (
     get_device_state,
@@ -90,10 +90,6 @@ class DeviceConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}
         self.device_modes: Dict[str, str] = {}
         self.recognition_sessions: Dict[str, Optional[int]] = {}
-        # NEW: current attendance session id, shared across all devices.
-        # The ESP32 echoes this back in mark-attendance so a stale scan
-        # from a previous attendance session can't be recorded into the
-        # current one.
         self.attendance_session_id: Optional[int] = None
         self.loop: asyncio.AbstractEventLoop | None = None
 
@@ -310,7 +306,7 @@ def get_target_device_endpoint(db: Session = Depends(get_db)):
         return {"target_device": None, "is_set": False, "is_online": False}
 
 
-# ── ENROLLMENT (unchanged — WebSocket-driven) ─────────────────────────────
+# ── ENROLLMENT ─────────────────────────────────────────────
 @router.post("/start-enrollment")
 async def start_enrollment(
     request: EnrollmentRequest,
@@ -858,17 +854,12 @@ def device_status(db: Session = Depends(get_db)):
     return {"connected": connected}
 
 
-# ── ATTENDANCE (pure polling) ─────────────────────────────────────────────
+# ── ATTENDANCE (pure polling) ─────────────────────────────
 @router.post("/start-attendance")
 async def start_attendance(
     request: StartAttendanceRequest,
     db: Session = Depends(get_db),
 ):
-    """
-    Start attendance mode. Pure polling — no WebSocket broadcast.
-    All devices are pinned to the same event and will pick it up on their
-    next /check-attendance poll.
-    """
     print(f"[ATTENDANCE] Starting attendance for event {request.event_id}")
 
     event = db.query(Event).filter(Event.id == request.event_id).first()
@@ -877,8 +868,6 @@ async def start_attendance(
 
     ensure_all_devices_free(db, "attendance")
 
-    # NEW: allocate a session id so the ESP32 can echo it back and we
-    # can reject stale scans from a previous attendance session.
     session_id = random.randint(1, 2_147_000_000)
     ws_manager.attendance_session_id = session_id
 
@@ -894,10 +883,6 @@ async def start_attendance(
 
 @router.post("/stop-attendance")
 async def stop_attendance(db: Session = Depends(get_db)):
-    """
-    Stop attendance mode. Pure polling — no WebSocket broadcast.
-    Devices will drop back to idle on their next /check-attendance poll.
-    """
     print("[ATTENDANCE] Stopping attendance")
 
     ws_manager.attendance_session_id = None
@@ -918,43 +903,26 @@ def check_attendance(
     Polled by the ESP32 while in attendance mode.
     Returns the active event details + session id, or {active: false}
     when attendance has been stopped or the event is no longer valid.
-
-    Pure polling — no WebSocket is used for attendance.
     """
     client_ip = req.client.host
 
     state = get_device_state(db, device_id)
     touch_last_seen(db, state)
 
-    # Only respond with an active session if the server currently has one.
     session_id = ws_manager.attendance_session_id
     if session_id is None:
         db.commit()
-        return {
-            "active": False,
-            "session_id": -1,
-            "event_id": -1,
-        }
+        return {"active": False, "session_id": -1, "event_id": -1}
 
     event_id = state.active_event_id
     if event_id is None:
-        # No event pinned → server thinks attendance is off.
         db.commit()
-        return {
-            "active": False,
-            "session_id": -1,
-            "event_id": -1,
-        }
+        return {"active": False, "session_id": -1, "event_id": -1}
 
     event = db.query(Event).filter(Event.id == event_id).first()
     if not event:
-        # Event deleted out from under us.
         db.commit()
-        return {
-            "active": False,
-            "session_id": -1,
-            "event_id": -1,
-        }
+        return {"active": False, "session_id": -1, "event_id": -1}
 
     db.commit()
 
@@ -962,11 +930,10 @@ def check_attendance(
         "active": True,
         "session_id": session_id,
         "event_id": event.id,
-        "event_title": event.title,
-        "event_date": event.event_date.isoformat() if event.event_date else None,
-        "start_time": event.start_time.isoformat() if event.start_time else None,
-        "end_time": event.end_time.isoformat() if event.end_time else None,
-        "location": event.location,
+        "event_title": event.event_title.name if event.event_title else "",
+        "event_start_date": event.start_date.isoformat() if event.start_date else None,
+        "event_end_date": event.end_date.isoformat() if event.end_date else None,
+        "location": event.location_ref.name if event.location_ref else "",
         "program_id": event.program_id,
     }
 
@@ -980,12 +947,6 @@ def mark_attendance(
     session_id: int = -1,
     db: Session = Depends(get_db),
 ):
-    """
-    Called by the ESP32 immediately after a successful match in
-    attendance mode. The device passes the event_id + session_id it
-    received from /check-attendance, so the write is fully synchronous
-    with the scan.
-    """
     client_ip = req.client.host
     log_request(
         "MARK-ATTENDANCE",
@@ -997,9 +958,6 @@ def mark_attendance(
     state = get_device_state(db, device_id)
     touch_last_seen(db, state)
 
-    # Session guard: if the server has rotated to a new session (or
-    # stopped attendance entirely) and the device is still echoing the
-    # old one, drop the write as stale.
     current_session = ws_manager.attendance_session_id
     if current_session is None:
         db.commit()
@@ -1008,12 +966,8 @@ def mark_attendance(
         db.commit()
         return PlainTextResponse("stale_session")
     if session_id == -1:
-        # Fallback for older firmware that doesn't echo session_id.
         session_id = current_session
 
-    # Resolve which event to write into.
-    # Prefer the event_id the device got from /check-attendance; fall
-    # back to the pinned active_event_id if the device didn't send one.
     resolved_event_id = event_id if event_id != -1 else state.active_event_id
     if resolved_event_id is None:
         db.commit()
@@ -1032,19 +986,44 @@ def mark_attendance(
         db.commit()
         return PlainTextResponse("no_active_event")
 
-    ph_tz_local = pytz.timezone("Asia/Manila")
-    ph_now_aware = datetime.now(ph_tz_local)
+    # ── NEW: multi-day aware time window check via EventDay ──
+    ph_now_aware = datetime.now(ph_tz)
+    today = ph_now_aware.date()
 
-    event_start = datetime.combine(ongoing_event.event_date, ongoing_event.start_time)
-    event_end = datetime.combine(ongoing_event.event_date, ongoing_event.end_time)
-    event_start = ph_tz_local.localize(event_start)
-    event_end = ph_tz_local.localize(event_end)
+    # Event must span today
+    if not (ongoing_event.start_date <= today <= ongoing_event.end_date):
+        log_request(
+            "MARK-ATTENDANCE",
+            client_ip,
+            f"| device={device_id} | finger_id={finger_id} | event not in date range",
+        )
+        db.commit()
+        return PlainTextResponse("event_not_active")
+
+    # Today's specific time window
+    today_window = (
+        db.query(EventDay)
+        .filter(EventDay.event_id == ongoing_event.id)
+        .filter(EventDay.day_date == today)
+        .first()
+    )
+    if today_window is None:
+        log_request(
+            "MARK-ATTENDANCE",
+            client_ip,
+            f"| device={device_id} | finger_id={finger_id} | no window for today",
+        )
+        db.commit()
+        return PlainTextResponse("event_not_active")
+
+    event_start = ph_tz.localize(datetime.combine(today, today_window.start_time))
+    event_end = ph_tz.localize(datetime.combine(today, today_window.end_time))
 
     if ph_now_aware < event_start or ph_now_aware > event_end:
         log_request(
             "MARK-ATTENDANCE",
             client_ip,
-            f"| device={device_id} | finger_id={finger_id} | event not in progress",
+            f"| device={device_id} | finger_id={finger_id} | outside today's window",
         )
         db.commit()
         return PlainTextResponse("event_not_active")
@@ -1089,7 +1068,7 @@ def mark_attendance(
         return PlainTextResponse("database_error")
 
 
-# ── DEVICE MODE (HTTP fallback for enroll/recognize/delete) ───────────────
+# ── DEVICE MODE ─────────────────────────────────────────────
 _mode_cache = {}
 _mode_cache_time = {}
 
@@ -1127,7 +1106,6 @@ def get_recognition_session(
     device_id: str = DEFAULT_DEVICE_ID,
     db: Session = Depends(get_db),
 ):
-    """Get the current recognition session ID and target finger for a device"""
     state = get_device_state(db, device_id)
     touch_last_seen(db, state)
 
