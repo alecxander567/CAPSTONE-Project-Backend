@@ -1,7 +1,7 @@
 from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from app.models import Notification, Event, User
+from app.models import Notification, Event, EventDay, User
 import logging
 from app.services.firebase_service import send_push_notification
 import threading
@@ -17,23 +17,43 @@ def notify_today_events(db: Session):
     now = datetime.now(PH_TZ).replace(tzinfo=None)
     today = now.date()
 
-    events_today = db.query(Event).filter(Event.event_date == today).all()
+    # Multi-day aware: events whose range covers today
+    events_today = (
+        db.query(Event)
+        .filter(Event.start_date <= today)
+        .filter(Event.end_date >= today)
+        .all()
+    )
     if not events_today:
         return
 
     users = db.query(User).all()
 
     for event in events_today:
-        event_datetime = datetime.combine(event.event_date, event.start_time)
+        # Today's specific time window
+        day_window = (
+            db.query(EventDay)
+            .filter(EventDay.event_id == event.id)
+            .filter(EventDay.day_date == today)
+            .first()
+        )
+        if not day_window:
+            continue
+
+        event_datetime = datetime.combine(today, day_window.start_time)
         time_diff = (event_datetime - now).total_seconds()
 
+        # Only notify if starting within next 30 min (or just started <60s ago)
         if not (-60 < time_diff <= 1800):
             continue
+
+        event_title = event.event_title.name if event.event_title else "Event"
+        event_desc = event.description or ""
 
         sent_tokens = set()
 
         for user in users:
-            notification_key = f"event_{event.id}_user_{user.id}"
+            notification_key = f"event_{event.id}_user_{user.id}_{today.isoformat()}"
 
             if notification_key in _sent_notifications:
                 continue
@@ -55,10 +75,10 @@ def notify_today_events(db: Session):
             notification = Notification(
                 user_id=user.id,
                 event_id=event.id,
-                title=event.title,
+                title=event_title,
                 message=(
-                    f"{event.description}\n\n"
-                    f"Starts at {event.start_time.strftime('%I:%M %p')}"
+                    f"{event_desc}\n\n"
+                    f"Starts at {day_window.start_time.strftime('%I:%M %p')}"
                 ),
                 type="event",
                 is_read=False,
@@ -75,9 +95,6 @@ def notify_today_events(db: Session):
                     f"Notification {notification.id} created for user {user.id}, event {event.id}"
                 )
 
-                # NOTE: no websocket push anymore — the frontend picks this up
-                # on its next poll of GET /notifications/
-
                 if user.device_token and user.device_token not in sent_tokens:
                     sent_tokens.add(user.device_token)
                     minutes_remaining = max(1, int(time_diff // 60))
@@ -85,8 +102,10 @@ def notify_today_events(db: Session):
                         target=send_push_notification,
                         args=(
                             user.device_token,
-                            f"EVENT REMINDER: {event.title}",
-                            f"Starting in {minutes_remaining} minute{'s' if minutes_remaining != 1 else ''} at {event.start_time.strftime('%I:%M %p')}\n{event.description}",
+                            f"EVENT REMINDER: {event_title}",
+                            f"Starting in {minutes_remaining} minute"
+                            f"{'s' if minutes_remaining != 1 else ''} at "
+                            f"{day_window.start_time.strftime('%I:%M %p')}\n{event_desc}",
                         ),
                         daemon=True,
                     ).start()

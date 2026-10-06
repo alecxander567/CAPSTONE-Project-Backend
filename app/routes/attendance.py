@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from app.core.database import get_db
 from app.models.user import User, FingerprintStatus
 from app.models.attendance import Attendance, AttendanceStatus
-from app.models.events import Event
+from app.models.events import Event, EventDay
 from app.models.programs import Program
 from pydantic import BaseModel
 import pytz
@@ -41,9 +41,12 @@ def update_attendance_status(
 
     ongoing_event = (
         db.query(Event)
-        .filter(Event.event_date == today)
-        .filter(Event.start_time <= now)
-        .filter(Event.end_time >= now)
+        .join(EventDay, EventDay.event_id == Event.id)
+        .filter(Event.start_date <= today)
+        .filter(Event.end_date >= today)
+        .filter(EventDay.day_date == today)
+        .filter(EventDay.start_time <= now)
+        .filter(EventDay.end_time >= now)
         .first()
     )
 
@@ -83,7 +86,7 @@ def update_attendance_status(
     )
 
 
-# ------------------- GET ATTENDANCE UPDATES (ONGOING OR SPECIFIC EVENT) -------------------
+# ------------------- GET ATTENDANCE UPDATES -------------------
 @router.get("/updates")
 def get_attendance_updates(event_id: int | None = None, db: Session = Depends(get_db)):
     if event_id:
@@ -97,9 +100,12 @@ def get_attendance_updates(event_id: int | None = None, db: Session = Depends(ge
 
         target_event = (
             db.query(Event)
-            .filter(Event.event_date == today)
-            .filter(Event.start_time <= now)
-            .filter(Event.end_time >= now)
+            .join(EventDay, EventDay.event_id == Event.id)
+            .filter(Event.start_date <= today)
+            .filter(Event.end_date >= today)
+            .filter(EventDay.day_date == today)
+            .filter(EventDay.start_time <= now)
+            .filter(EventDay.end_time >= now)
             .first()
         )
 
@@ -155,16 +161,16 @@ def get_attendance_by_event(event_id: int, db: Session = Depends(get_db)):
 # ------------------- GET ATTENDANCE PER EVENT (FOR CHARTS) -------------------
 @router.get("/per-event")
 def get_attendance_per_event(year: int | None = None, db: Session = Depends(get_db)):
-    query = db.query(Event).order_by(Event.event_date.asc(), Event.start_time.asc())
+    query = db.query(Event).order_by(Event.start_date.asc())
 
     if year:
-        query = query.filter(extract("year", Event.event_date) == year)
+        query = query.filter(extract("year", Event.start_date) == year)
 
     events = query.all()
 
     return [
         {
-            "event": event.title,
+            "event": event.event_title.name if event.event_title else "",
             "students": (
                 db.query(Attendance)
                 .filter(Attendance.event_id == event.id)
@@ -181,7 +187,7 @@ def get_attendance_per_event(year: int | None = None, db: Session = Depends(get_
 def get_attendance_per_program(db: Session = Depends(get_db)):
     latest_event = (
         db.query(Event)
-        .order_by(Event.event_date.desc(), Event.start_time.desc())
+        .order_by(Event.start_date.desc(), Event.id.desc())
         .first()
     )
 
@@ -220,7 +226,11 @@ def get_attendance_per_program(db: Session = Depends(get_db)):
                 "present": present_students,
                 "total_students": total_students,
                 "percentage": percentage,
-                "event": latest_event.title if latest_event else None,
+                "event": (
+                    latest_event.event_title.name
+                    if latest_event and latest_event.event_title
+                    else None
+                ),
             }
         )
 

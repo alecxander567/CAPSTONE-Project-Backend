@@ -13,6 +13,8 @@ from app.routes import (
     fingerprint,
     attendance,
     device,
+    event_titles,   # NEW
+    locations,      # NEW
 )
 from app.routes.fingerprint import ws_manager
 from app.core.background_task import event_notifier_loop
@@ -31,7 +33,6 @@ async def device_watchdog_loop():
     while True:
         try:
             with get_db_context() as db:
-                # Log current modes before healing
                 devices = get_all_device_states(db)
                 for d in devices:
                     print(f"[Watchdog] Device {d.device_id} mode: {d.mode}")
@@ -46,10 +47,6 @@ async def device_watchdog_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # FIXED: capture the running event loop and hand it to ws_manager so
-    # sync `def` endpoints (which FastAPI runs in a worker threadpool with
-    # NO running event loop) can still schedule WebSocket broadcasts via
-    # ws_manager.schedule(...) -> asyncio.run_coroutine_threadsafe(...).
     ws_manager.set_loop(asyncio.get_running_loop())
 
     Base.metadata.create_all(bind=engine)
@@ -120,6 +117,8 @@ app.include_router(notification.router)
 app.include_router(fingerprint.router)
 app.include_router(attendance.router)
 app.include_router(device.router)
+app.include_router(event_titles.router)   # NEW
+app.include_router(locations.router)      # NEW
 app.include_router(health)
 
 
